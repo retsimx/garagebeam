@@ -11,7 +11,8 @@ filenames = [
     'boot.py',
     'main.py',
     'micropython_ota.py',
-    'mqtt_as.py'
+    'mqtt_as.py',
+    'ble.py'
 ]
 
 rp2.country('AU')
@@ -46,7 +47,7 @@ micropython_ota.ota_update(
     use_version_prefix=True,
     hard_reset_device=True,
     soft_reset_device=False,
-    timeout=15
+    timeout=60
 )
 
 led.off()

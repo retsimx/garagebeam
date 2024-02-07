@@ -13,6 +13,7 @@ cp boot.py /tmp/firmware/garagebeam/${new_version}_boot.py
 cp main.py /tmp/firmware/garagebeam/${new_version}_main.py
 cp micropython_ota.py /tmp/firmware/garagebeam/${new_version}_micropython_ota.py
 cp mqtt_as.py /tmp/firmware/garagebeam/${new_version}_mqtt_as.py
+cp ble.py /tmp/firmware/garagebeam/${new_version}_ble.py
 
 # Remove old firmware files
 rm -f /tmp/firmware/garagebeam/${old_version}_*.py

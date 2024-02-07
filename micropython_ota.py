@@ -10,11 +10,23 @@ def check_version(host, project, auth=None, timeout=5) -> (bool, str):
         if 'version' in uos.listdir():
             with open('version', 'r') as current_version_file:
                 current_version = current_version_file.readline().strip()
-        if auth:
-            response = urequests.get(f'{host}/{project}/version', headers={'Authorization': f'Basic {auth}'},
-                                     timeout=timeout)
-        else:
-            response = urequests.get(f'{host}/{project}/version', timeout=timeout)
+
+        last_exc = None
+        for i in range(10):
+            try:
+                if auth:
+                    response = urequests.get(f'{host}/{project}/version', headers={'Authorization': f'Basic {auth}'},
+                                             timeout=timeout)
+                else:
+                    response = urequests.get(f'{host}/{project}/version', timeout=timeout)
+
+                break
+            except Exception as e:
+                last_exc = e
+
+        if i == 9:
+            raise last_exc
+
         response_status_code = response.status_code
         response_text = response.text
         response.close()
@@ -50,12 +62,23 @@ def ota_update(host, project, filenames, use_version_prefix=True, user=None, pas
             except:
                 pass
             for filename in filenames:
-                if auth:
-                    response = urequests.get(f'{host}/{project}/{remote_version}{prefix_or_path_separator}{filename}',
-                                             headers={'Authorization': f'Basic {auth}'}, timeout=timeout)
-                else:
-                    response = urequests.get(f'{host}/{project}/{remote_version}{prefix_or_path_separator}{filename}',
-                                             timeout=timeout)
+                last_exc = None
+                for i in range(10):
+                    try:
+                        if auth:
+                            response = urequests.get(f'{host}/{project}/{remote_version}{prefix_or_path_separator}{filename}',
+                                                     headers={'Authorization': f'Basic {auth}'}, timeout=timeout)
+                        else:
+                            response = urequests.get(f'{host}/{project}/{remote_version}{prefix_or_path_separator}{filename}',
+                                                     timeout=timeout)
+
+                        break
+                    except Exception as e:
+                        last_exc = e
+
+                if i == 9:
+                    raise last_exc
+
                 response_status_code = response.status_code
                 response_text = response.text
                 response.close()
