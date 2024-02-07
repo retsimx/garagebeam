@@ -38,7 +38,7 @@ async def sensor_task(beam_pin):
                     last_value = new_value
                     temp_characteristic.write(struct.pack("<h", int(new_value)))
 
-                await asyncio.sleep_ms(10)
+                await asyncio.sleep_ms(5)
         except:
             await asyncio.sleep_ms(1000)
 
