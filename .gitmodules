@@ -1,3 +1,0 @@
-[submodule "lib/cyw43"]
-	path = lib/cyw43
-	url = https://github.com/embassy-rs/cyw43.git
