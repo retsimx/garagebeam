@@ -2,11 +2,11 @@ import asyncio
 
 import machine
 
+from ble import run_ble
 from mqtt_as import MQTTClient, config
 from secrets import WIFI_SSID, WIFI_PASSWORD, MQTT_IP
 
 BEAM_PIN_NUM = 26
-
 beam_pin = machine.Pin(BEAM_PIN_NUM, machine.Pin.IN, pull=machine.Pin.PULL_UP)
 
 # Local configuration
@@ -38,10 +38,12 @@ async def poll(client):
         if last != new_value:
             last = new_value
             await client.publish("garagebeam/status", str(beam_pin.value()))
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.10)
 
 
 async def main(client):
+    asyncio.create_task(run_ble(beam_pin))
+
     await client.connect()
     for coroutine in (up, messages):
         asyncio.create_task(coroutine(client))
