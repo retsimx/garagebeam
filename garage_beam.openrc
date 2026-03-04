@@ -1,0 +1,17 @@
+#!/sbin/openrc-run
+
+name="garage_beam"
+description="Garage Beam BLE Bridge"
+command="/root/garage_beam/garage_beam"
+command_background="yes"
+directory="/root/garage_beam"
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/garage_beam.log"
+error_log="/var/log/garage_beam.log"
+
+export RUST_LOG=info
+
+depend() {
+    need dbus bluetooth
+    after net
+}
