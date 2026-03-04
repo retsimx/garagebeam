@@ -18,7 +18,7 @@ pub async fn run_loop(
 
     let mut last_state = None;
     let mut last_write_time = tokio::time::Instant::now();
-    let heartbeat_interval = Duration::from_secs(60);
+    let heartbeat_interval = Duration::from_secs(2);
 
     loop {
         let current_state = reader.read_pin()?;
