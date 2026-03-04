@@ -17,13 +17,21 @@ pub async fn run_loop(
     info!("Connected successfully!");
 
     let mut last_state = None;
+    let mut last_write_time = tokio::time::Instant::now();
+    let heartbeat_interval = Duration::from_secs(60);
 
     loop {
         let current_state = reader.read_pin()?;
-        if last_state != Some(current_state) {
+        let now = tokio::time::Instant::now();
+
+        // Write if the state has changed OR if the heartbeat interval has elapsed
+        if last_state != Some(current_state)
+            || now.duration_since(last_write_time) >= heartbeat_interval
+        {
             last_state = Some(current_state);
-            info!("State changed to: {}", current_state);
+            info!("Writing state to BLE: {}", current_state);
             client.write_state(current_state).await?;
+            last_write_time = now;
         }
 
         tokio::time::sleep(Duration::from_millis(DELAY_MS)).await;
