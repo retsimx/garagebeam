@@ -100,8 +100,10 @@ impl BleClient for BtleplugClient {
 
     async fn write_state(&self, state: bool) -> Result<()> {
         if let (Some(p), Some(c)) = (&self.peripheral, &self.characteristic) {
-            let val = if state { vec![1] } else { vec![0] };
-            p.write(c, &val, WriteType::WithResponse)
+            // Pack state as little-endian 16-bit signed integer (`<h`) to match Python
+            let val = if state { 1i16 } else { 0i16 };
+            let val_bytes = val.to_le_bytes();
+            p.write(c, &val_bytes, WriteType::WithResponse)
                 .await
                 .context("Failed to write to char")?;
             Ok(())
