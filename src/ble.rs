@@ -57,7 +57,12 @@ impl BleClient for BtleplugClient {
             .await
             .context("Failed to start scan")?;
 
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
+
+        let stop_res = central.stop_scan().await;
+        if let Err(e) = stop_res {
+            tracing::warn!("Failed to stop scan: {:?}", e);
+        }
 
         let peripherals = central
             .peripherals()
