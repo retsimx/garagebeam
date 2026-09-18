@@ -337,6 +337,7 @@ dependencies = [
  "async-trait",
  "btleplug",
  "gpiocdev",
+ "libc",
  "libdbus-sys",
  "mockall",
  "tokio",

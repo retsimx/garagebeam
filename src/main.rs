@@ -4,6 +4,7 @@ use tracing::{error, info};
 
 use garage_beam::ble::BtleplugClient;
 use garage_beam::gpio::ChardevGpio;
+use garage_beam::interval::HciInterval;
 use garage_beam::run_loop;
 
 const DEVICE_MAC: &str = "***REMOVED-MAC***";
@@ -17,7 +18,8 @@ async fn main() -> Result<()> {
         match ChardevGpio::new("pinctrl-bcm2835", 4) {
             Ok(gpio) => {
                 let client = BtleplugClient::new(DEVICE_MAC.to_string());
-                let result = run_loop(Box::new(client), Box::new(gpio)).await;
+                let interval = HciInterval::new(DEVICE_MAC.to_string());
+                let result = run_loop(Box::new(client), Box::new(gpio), Box::new(interval)).await;
 
                 if let Err(e) = result {
                     error!("Error within run loop: {:?}", e);
