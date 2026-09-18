@@ -12,6 +12,7 @@ anyhow = "1.0"
 async-trait = "0.1"
 uuid = "1.0"
 libdbus-sys = { version = "0.2", features = ["vendored"] }
+gpiocdev = { version = "0.8", features = ["async_tokio"] }
 
 [dev-dependencies]
 mockall = "0.13"
