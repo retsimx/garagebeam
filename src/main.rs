@@ -3,11 +3,10 @@ use std::time::Duration;
 use tracing::{error, info};
 
 use garage_beam::ble::BtleplugClient;
-use garage_beam::gpio::SysfsGpio;
+use garage_beam::gpio::ChardevGpio;
 use garage_beam::run_loop;
 
 const DEVICE_MAC: &str = "***REMOVED-MAC***";
-const GPIO_PIN: u32 = 516;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -15,10 +14,10 @@ async fn main() -> Result<()> {
 
     loop {
         info!("Initializing system...");
-        match SysfsGpio::new(GPIO_PIN) {
-            Ok(sysfs_gpio) => {
+        match ChardevGpio::new("pinctrl-bcm2835", 4) {
+            Ok(gpio) => {
                 let client = BtleplugClient::new(DEVICE_MAC.to_string());
-                let result = run_loop(Box::new(client), Box::new(sysfs_gpio)).await;
+                let result = run_loop(Box::new(client), Box::new(gpio)).await;
 
                 if let Err(e) = result {
                     error!("Error within run loop: {:?}", e);
