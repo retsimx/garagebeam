@@ -47,6 +47,7 @@ CI runs the same checks on every push and pull request:
 - the host `cargo test` suite, hardware-free
 - the ARM release cross build (`arm-unknown-linux-musleabihf`)
 - `shellcheck` over the OpenRC service script (`deploy.sh` too, when present)
+  and `scripts/latency_report.sh`
 - a cross-repo byte-equality check of `contract.toml` against the sibling firmware
 
 See [`.github/workflows/ci.yml`](.github/workflows/ci.yml) for the exact steps.
@@ -103,3 +104,82 @@ start at the 7.5 ms minimum, so the lamp link comes up fast before the explicit
 `LE Connection Update` lands; the sprinkler bridge `rshunterbtt` requests and
 enforces its own interval at runtime and is unaffected. Do not remove this value
 as "cleanup" — see design doc 006 (host LE interval).
+
+## Latency measurement (GB-6)
+
+`garage_beam` can emit one raw latency sample per accepted beam edge. The
+instrumentation is **deny-by-default**: it is active only when
+`GARAGE_BEAM_LATENCY` is set to a truthy value — `1`, `true`, `yes` or `on`,
+compared case-insensitively. Anything else, including unset, leaves the control
+path unchanged and adds no clock reads, no characteristic reads and no per-event
+log lines (a single startup line still reports `enabled=false`). The gate is read
+once at startup, so a restart is required to change it.
+
+The committed OpenRC script exports only `GARAGE_BEAM_DEVICE_ADDRESS` and
+`RUST_LOG`, so export `GARAGE_BEAM_LATENCY` from the environment that launches
+`garage_beam`. For a bench run, prefix the command:
+
+```sh
+GARAGE_BEAM_LATENCY=1 GARAGE_BEAM_DEVICE_ADDRESS="$ADDR" ./garage_beam 2>&1 | tee latency-idle.log
+```
+
+Each accepted edge then emits a line at INFO with target `garage_beam::latency`:
+
+```
+2026-09-19T16:00:00.000000Z  INFO garage_beam::latency: latency_sample edge_to_write_ns=123456 write_to_read_ns=78901 read_back=1
+```
+
+### Segment model
+
+| Segment | Meaning | Clock |
+|---|---|---|
+| (a) `edge_to_write_ns` | beam edge (kernel GPIO event timestamp) → BLE write issued | host `CLOCK_MONOTONIC` |
+| (b) `write_to_read_ns` | BLE write → measurement read returned | host `CLOCK_MONOTONIC` |
+| (c) total | derived `(a) + (b)` for samples that carry a `(b)` value | host |
+| (d) peripheral internal | peripheral receive → lamp applied, from the peripheral's own log | peripheral monotonic |
+
+Segment (b) is emitted only when the measurement read succeeds, so some samples
+carry (a) alone. The peripheral delta (d) is a cross-repo item owned by
+`retsimx/garagelight` (GL-13/#14) and is consumed as a sanity check.
+
+### Run procedure
+
+Measure each of the four load conditions separately, and collect at least 50
+beam transitions in each:
+
+1. **idle** — no DHT11 read, no OTA, no other traffic.
+2. **during a DHT11 read**.
+3. **during an OTA download**.
+4. **with active WiFi traffic**.
+
+For each condition, enable the gate, exercise the beam until at least 50
+`latency_sample` lines are captured, then stop. Keep one log per condition, for
+example `latency-idle.log`, `latency-dht.log`, `latency-ota.log` and
+`latency-wifi.log`. Summarise a log with:
+
+```sh
+scripts/latency_report.sh latency-idle.log
+```
+
+The report prints `N`, `min`, `p50`, `p95`, `p99` and the full ascending raw
+sample list for segments (a), (b) and the derived (c), so the distribution (and
+any bimodality) stays visible. With no argument it reads standard input.
+
+### Percentile method
+
+Percentiles are **nearest-rank**: sort the samples ascending, then take rank
+`ceil(p/100 * N)`, 1-based and clamped to `1..N`. There is no interpolation, so
+every reported value is an observed sample.
+
+### Limitations
+
+- Host and peripheral clocks are unsynchronised, so segment (d) cannot be
+  subtracted from the host segments; it is a same-clock check on the peripheral
+  only.
+- (b) is a round-trip **bound** on peripheral receive→apply, not pure
+  peripheral time: it includes the read round trip.
+- The beam sensor and its mechanical relay contribute a hardware floor of
+  roughly 6–20 ms that is estimated, not measured in software.
+- Measurement mode performs an extra read after each accepted write, so
+  `(a) + (b)` is an upper bound on the production path, not the production path
+  itself.

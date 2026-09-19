@@ -1,5 +1,6 @@
 pub mod ble;
 pub mod gpio;
+pub mod instrumentation;
 pub mod interval;
 
 use anyhow::Result;
@@ -52,6 +53,7 @@ pub async fn run_loop(
     mut client: Box<dyn BleClient>,
     mut reader: Box<dyn GpioReader>,
     interval: Box<dyn IntervalControl>,
+    instrumentation: crate::instrumentation::Instrumentation,
 ) -> Result<()> {
     client.connect().await?;
     info!("Connected successfully!");
@@ -140,7 +142,55 @@ pub async fn run_loop(
                     if let WriteDecision::Write(value) =
                         schedule_write(ConnectionEvent::Steady, last_fact, last_write, fact, now)
                     {
-                        client.write_state(value).await?;
+                        if instrumentation.enabled() {
+                            let t_write = crate::instrumentation::monotonic_ns();
+                            client.write_state(value).await?;
+                            if t_write < edge.timestamp_ns {
+                                tracing::warn!(
+                                    target: "garage_beam::latency",
+                                    edge_ns = edge.timestamp_ns,
+                                    write_ns = t_write,
+                                    "latency_clock_skew"
+                                );
+                            }
+                            let edge_to_write_ns = t_write.saturating_sub(edge.timestamp_ns);
+                            let t0 = crate::instrumentation::monotonic_ns();
+                            let (write_to_read_ns, read_back) = match client.read_state().await {
+                                Ok(byte) => (
+                                    Some(crate::instrumentation::monotonic_ns().saturating_sub(t0)),
+                                    Some(byte),
+                                ),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        target: "garage_beam::latency",
+                                        error = %e,
+                                        "latency_read_failed"
+                                    );
+                                    (None, None)
+                                }
+                            };
+                            match write_to_read_ns {
+                                Some(b) => {
+                                    tracing::info!(
+                                        target: "garage_beam::latency",
+                                        edge_to_write_ns,
+                                        write_to_read_ns = b,
+                                        read_back = read_back,
+                                        "latency_sample"
+                                    );
+                                }
+                                None => {
+                                    tracing::info!(
+                                        target: "garage_beam::latency",
+                                        edge_to_write_ns,
+                                        read_back = read_back,
+                                        "latency_sample"
+                                    );
+                                }
+                            }
+                        } else {
+                            client.write_state(value).await?;
+                        }
                         last_fact = Some(value);
                         last_write = Some(now);
                     }
@@ -208,6 +258,10 @@ mod tests {
             self.inner.write_state(state).await
         }
 
+        async fn read_state(&self) -> Result<u8> {
+            self.inner.read_state().await
+        }
+
         async fn disconnect(&mut self) -> Result<()> {
             self.inner.disconnect().await
         }
@@ -238,6 +292,10 @@ mod tests {
         async fn write_state(&self, state: bool) -> Result<()> {
             self.writes.lock().unwrap().push(state);
             Ok(())
+        }
+
+        async fn read_state(&self) -> Result<u8> {
+            Ok(0)
         }
 
         async fn disconnect(&mut self) -> Result<()> {
@@ -275,6 +333,7 @@ mod tests {
             pending(client),
             Box::new(gpio),
             Box::new(passing_interval()),
+            crate::instrumentation::Instrumentation::from_value(None),
         )
         .await;
         assert_eq!(res.unwrap_err().to_string(), "stop");
@@ -312,6 +371,121 @@ mod tests {
             pending(client),
             Box::new(gpio),
             Box::new(passing_interval()),
+            crate::instrumentation::Instrumentation::from_value(None),
+        )
+        .await;
+        assert_eq!(res.unwrap_err().to_string(), "stop");
+    }
+
+    #[tokio::test]
+    async fn instrumented_edge_reads_once_and_logs() {
+        let mut client = MockBleClient::new();
+        let mut gpio = MockGpioReader::new();
+
+        client.expect_connect().times(1).returning(|| Ok(()));
+        client
+            .expect_write_state()
+            .with(eq(true))
+            .times(1)
+            .returning(|_| Ok(()));
+        client
+            .expect_write_state()
+            .with(eq(false))
+            .times(1)
+            .returning(|_| Ok(()));
+        client.expect_read_state().times(1).returning(|| Ok(0));
+        gpio.expect_read_level()
+            .times(1)
+            .returning(|| Ok(Level::Low));
+        gpio.expect_wait_for_edge()
+            .times(1)
+            .returning(|| Ok(edge(Level::High)));
+        gpio.expect_wait_for_edge()
+            .times(1)
+            .returning(|| Err(anyhow::anyhow!("stop")));
+
+        let res = run_loop(
+            pending(client),
+            Box::new(gpio),
+            Box::new(passing_interval()),
+            crate::instrumentation::Instrumentation::from_value(Some("1")),
+        )
+        .await;
+        assert_eq!(res.unwrap_err().to_string(), "stop");
+    }
+
+    #[tokio::test]
+    async fn read_error_does_not_abort_run() {
+        let mut client = MockBleClient::new();
+        let mut gpio = MockGpioReader::new();
+
+        client.expect_connect().times(1).returning(|| Ok(()));
+        client
+            .expect_write_state()
+            .with(eq(true))
+            .times(1)
+            .returning(|_| Ok(()));
+        client
+            .expect_write_state()
+            .with(eq(false))
+            .times(1)
+            .returning(|_| Ok(()));
+        client
+            .expect_read_state()
+            .times(1)
+            .returning(|| Err(anyhow::anyhow!("read failed")));
+        gpio.expect_read_level()
+            .times(1)
+            .returning(|| Ok(Level::Low));
+        gpio.expect_wait_for_edge()
+            .times(1)
+            .returning(|| Ok(edge(Level::High)));
+        gpio.expect_wait_for_edge()
+            .times(1)
+            .returning(|| Err(anyhow::anyhow!("stop")));
+
+        let res = run_loop(
+            pending(client),
+            Box::new(gpio),
+            Box::new(passing_interval()),
+            crate::instrumentation::Instrumentation::from_value(Some("1")),
+        )
+        .await;
+        assert_eq!(res.unwrap_err().to_string(), "stop");
+    }
+
+    #[tokio::test]
+    async fn disabled_edge_never_reads() {
+        let mut client = MockBleClient::new();
+        let mut gpio = MockGpioReader::new();
+
+        client.expect_connect().times(1).returning(|| Ok(()));
+        client
+            .expect_write_state()
+            .with(eq(true))
+            .times(1)
+            .returning(|_| Ok(()));
+        client
+            .expect_write_state()
+            .with(eq(false))
+            .times(1)
+            .returning(|_| Ok(()));
+        // No `expect_read_state`: any read would panic and fail the run.
+        gpio.expect_read_level()
+            .times(1)
+            .returning(|| Ok(Level::Low));
+        gpio.expect_wait_for_edge()
+            .times(1)
+            .returning(|| Ok(edge(Level::High)));
+        gpio.expect_wait_for_edge()
+            .times(1)
+            .returning(|| Err(anyhow::anyhow!("stop")));
+
+        let res = run_loop(
+            pending(client),
+            Box::new(gpio),
+            Box::new(passing_interval()),
+            crate::instrumentation::Instrumentation::from_value(None),
         )
         .await;
         assert_eq!(res.unwrap_err().to_string(), "stop");
@@ -352,6 +526,7 @@ mod tests {
             pending(client),
             Box::new(gpio),
             Box::new(passing_interval()),
+            crate::instrumentation::Instrumentation::from_value(None),
         )
         .await;
         assert_eq!(res.unwrap_err().to_string(), "stop");
@@ -435,6 +610,7 @@ mod tests {
             pending(client),
             Box::new(gpio),
             Box::new(passing_interval()),
+            crate::instrumentation::Instrumentation::from_value(None),
         )
         .await;
         assert_eq!(res.unwrap_err().to_string(), "stop");
@@ -457,6 +633,7 @@ mod tests {
             pending(client),
             Box::new(gpio),
             Box::new(passing_interval()),
+            crate::instrumentation::Instrumentation::from_value(None),
         )
         .await;
         assert_eq!(res.unwrap_err().to_string(), "stop");
@@ -479,6 +656,7 @@ mod tests {
             Box::new(client),
             Box::new(gpio),
             Box::new(passing_interval()),
+            crate::instrumentation::Instrumentation::from_value(None),
         )
         .await;
 
@@ -513,6 +691,7 @@ mod tests {
             pending(client),
             Box::new(gpio),
             Box::new(passing_interval()),
+            crate::instrumentation::Instrumentation::from_value(None),
         )
         .await;
         assert_eq!(res.unwrap_err().to_string(), "stop");
@@ -554,7 +733,13 @@ mod tests {
             .times(1)
             .returning(|| Err(anyhow::anyhow!("stop")));
 
-        let res = run_loop(pending(client), Box::new(gpio), Box::new(interval)).await;
+        let res = run_loop(
+            pending(client),
+            Box::new(gpio),
+            Box::new(interval),
+            crate::instrumentation::Instrumentation::from_value(None),
+        )
+        .await;
         assert_eq!(res.unwrap_err().to_string(), "stop");
     }
 
@@ -583,7 +768,13 @@ mod tests {
             .times(1)
             .returning(|| Err(anyhow::anyhow!("stop")));
 
-        let res = run_loop(pending(client), Box::new(gpio), Box::new(interval)).await;
+        let res = run_loop(
+            pending(client),
+            Box::new(gpio),
+            Box::new(interval),
+            crate::instrumentation::Instrumentation::from_value(None),
+        )
+        .await;
         assert_eq!(res.unwrap_err().to_string(), "stop");
     }
 
@@ -611,7 +802,13 @@ mod tests {
             .times(1)
             .returning(|| Err(anyhow::anyhow!("stop")));
 
-        let res = run_loop(pending(client), Box::new(gpio), Box::new(interval)).await;
+        let res = run_loop(
+            pending(client),
+            Box::new(gpio),
+            Box::new(interval),
+            crate::instrumentation::Instrumentation::from_value(None),
+        )
+        .await;
         assert_eq!(res.unwrap_err().to_string(), "stop");
     }
 
