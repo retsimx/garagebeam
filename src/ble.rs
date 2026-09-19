@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -24,6 +25,9 @@ use mockall::{automock, predicate::*};
 pub trait BleClient: Send + Sync {
     async fn connect(&mut self) -> Result<()>;
     async fn write_state(&self, state: bool) -> Result<()>;
+    /// Resolves the next time a fresh connection is established after the one
+    /// `connect()` returned. Never resolves for the already-observed link.
+    async fn wait_for_reconnect(&self) -> Result<()>;
     #[allow(dead_code)]
     async fn disconnect(&mut self) -> Result<()>;
 }
@@ -61,12 +65,62 @@ enum LinkStatus {
     Fatal(String),
 }
 
+/// Connection-generation state machine shared by the supervisor and the client.
+///
+/// The supervisor calls [`advance`](Self::advance) immediately before it
+/// publishes [`LinkStatus::Connected`]; `connect()` calls
+/// [`mark_seen`](Self::mark_seen) once it observes that link, so the epoch of
+/// the already-observed link is never reported as a reconnect. Each `advance`
+/// after that resolves exactly one [`wait`](Self::wait).
+struct ConnectionEpoch {
+    tx: watch::Sender<u64>,
+    rx: watch::Receiver<u64>,
+    last_seen: AtomicU64,
+}
+
+impl ConnectionEpoch {
+    fn new() -> Self {
+        let (tx, rx) = watch::channel(0u64);
+        Self {
+            tx,
+            rx,
+            last_seen: AtomicU64::new(0),
+        }
+    }
+
+    /// Announce a fresh connection. Call BEFORE publishing `Connected`.
+    fn advance(&self) {
+        self.tx.send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+    }
+
+    /// Mark the link just observed, so it is not reported as a reconnect.
+    fn mark_seen(&self) {
+        self.last_seen.store(*self.rx.borrow(), Ordering::SeqCst);
+    }
+
+    /// Resolves once the epoch advances past the last observed value.
+    async fn wait(&self) -> Result<()> {
+        let mut rx = self.rx.clone();
+        loop {
+            let current = *rx.borrow();
+            if current != self.last_seen.load(Ordering::SeqCst) {
+                self.last_seen.store(current, Ordering::SeqCst);
+                return Ok(());
+            }
+            rx.changed()
+                .await
+                .context("connection epoch channel closed")?;
+        }
+    }
+}
+
 pub struct BtleplugClient {
     mac_address: String,
     connection: Arc<Mutex<Option<Connection>>>,
     reconnect_tx: mpsc::UnboundedSender<()>,
     status_tx: watch::Sender<LinkStatus>,
     status_rx: watch::Receiver<LinkStatus>,
+    epoch: Arc<ConnectionEpoch>,
     reconnect_rx: Option<mpsc::UnboundedReceiver<()>>,
     supervisor: Option<tokio::task::JoinHandle<()>>,
 }
@@ -81,6 +135,7 @@ impl BtleplugClient {
             reconnect_tx,
             status_tx,
             status_rx,
+            epoch: Arc::new(ConnectionEpoch::new()),
             reconnect_rx: Some(reconnect_rx),
             supervisor: None,
         }
@@ -106,6 +161,7 @@ async fn supervise(
     mac_address: String,
     connection: Arc<Mutex<Option<Connection>>>,
     status_tx: watch::Sender<LinkStatus>,
+    epoch: Arc<ConnectionEpoch>,
     mut reconnect_rx: mpsc::UnboundedReceiver<()>,
 ) {
     let manager = match Manager::new().await {
@@ -234,6 +290,7 @@ async fn supervise(
 
         attempt = 0;
         *connection.lock().unwrap() = Some(connection_state);
+        epoch.advance();
         let _ = status_tx.send_replace(LinkStatus::Connected);
         // A write failure while the supervisor was still acquiring buffered a
         // reconnect signal; drop it before entering Hold so it cannot tear down
@@ -279,6 +336,7 @@ impl BleClient for BtleplugClient {
             let mac_address = self.mac_address.clone();
             let connection = Arc::clone(&self.connection);
             let status_tx = self.status_tx.clone();
+            let epoch = Arc::clone(&self.epoch);
             let reconnect_rx = self
                 .reconnect_rx
                 .take()
@@ -287,6 +345,7 @@ impl BleClient for BtleplugClient {
                 mac_address,
                 connection,
                 status_tx,
+                epoch,
                 reconnect_rx,
             )));
         }
@@ -296,7 +355,10 @@ impl BleClient for BtleplugClient {
             // between this check and `changed` still wakes us.
             let status = self.status_rx.borrow().clone();
             match status {
-                LinkStatus::Connected => return Ok(()),
+                LinkStatus::Connected => {
+                    self.epoch.mark_seen();
+                    return Ok(());
+                }
                 LinkStatus::Fatal(message) => return Err(anyhow!(message)),
                 LinkStatus::Waiting => {
                     self.status_rx
@@ -335,6 +397,10 @@ impl BleClient for BtleplugClient {
             return Err(e).context("Failed to write to state characteristic");
         }
         Ok(())
+    }
+
+    async fn wait_for_reconnect(&self) -> Result<()> {
+        self.epoch.wait().await
     }
 
     async fn disconnect(&mut self) -> Result<()> {
@@ -431,5 +497,58 @@ mod tests {
         }
         assert_eq!(backoff_delay(3), Duration::from_secs(8));
         assert_eq!(backoff_delay(10), Duration::from_secs(8));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn epoch_first_connect_does_not_report_reconnect() {
+        let epoch = ConnectionEpoch::new();
+        epoch.advance();
+        epoch.mark_seen();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), epoch.wait())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn epoch_one_increment_resolves_exactly_once() {
+        let epoch = ConnectionEpoch::new();
+        epoch.advance();
+        epoch.mark_seen();
+        epoch.advance();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), epoch.wait())
+                .await
+                .is_ok()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), epoch.wait())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn epoch_no_advance_does_not_resolve() {
+        let epoch = ConnectionEpoch::new();
+        epoch.advance();
+        epoch.mark_seen();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), epoch.wait())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn epoch_unmarked_increment_resolves_once() {
+        let epoch = ConnectionEpoch::new();
+        epoch.advance();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), epoch.wait())
+                .await
+                .is_ok()
+        );
     }
 }
