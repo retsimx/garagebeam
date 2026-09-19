@@ -32,13 +32,25 @@ async fn main() -> Result<()> {
 
     let address = address_from(std::env::var(DEVICE_ADDRESS_ENV).ok().as_deref())?;
 
+    let instrumentation = garage_beam::instrumentation::Instrumentation::from_env();
+    info!(
+        "latency instrumentation enabled={}",
+        instrumentation.enabled()
+    );
+
     loop {
         info!("Initializing system...");
         match ChardevGpio::new("pinctrl-bcm2835", 4) {
             Ok(gpio) => {
                 let client = BtleplugClient::new(address.clone());
                 let interval = HciInterval::new(address.clone());
-                let result = run_loop(Box::new(client), Box::new(gpio), Box::new(interval)).await;
+                let result = run_loop(
+                    Box::new(client),
+                    Box::new(gpio),
+                    Box::new(interval),
+                    instrumentation,
+                )
+                .await;
 
                 if let Err(e) = result {
                     error!("Error within run loop: {:?}", e);
