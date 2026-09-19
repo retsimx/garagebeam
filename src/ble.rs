@@ -13,6 +13,8 @@ use tokio::sync::{mpsc, watch};
 
 pub const SERVICE_UUID: &str = "6a4c0001-b5a3-4f1e-9c2d-7e8f9a0b1c2d";
 pub const CHARACTERISTIC_UUID: &str = "6a4c0002-b5a3-4f1e-9c2d-7e8f9a0b1c2d";
+pub const FACT_INTACT: u8 = 0x00;
+pub const FACT_BROKEN: u8 = 0x01;
 pub const CONNECT_BOUND: Duration = Duration::from_secs(30);
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
 const BACKOFF_MAX_SHIFT: u32 = 3;
@@ -51,6 +53,14 @@ pub fn connect_decision(configured: &str, candidate: &str, elapsed: Duration) ->
 
 pub fn backoff_delay(attempt: u32) -> Duration {
     BACKOFF_BASE * (1u32 << attempt.min(BACKOFF_MAX_SHIFT))
+}
+
+pub fn fact_byte(state: bool) -> u8 {
+    if state {
+        FACT_BROKEN
+    } else {
+        FACT_INTACT
+    }
 }
 
 struct Connection {
@@ -382,7 +392,7 @@ impl BleClient for BtleplugClient {
         };
         let (peripheral, characteristic) = target.ok_or_else(|| anyhow!("not connected"))?;
 
-        let byte = if state { 0x01u8 } else { 0x00u8 };
+        let byte = fact_byte(state);
         if let Err(e) = peripheral
             .write(&characteristic, &[byte], WriteType::WithoutResponse)
             .await
@@ -427,6 +437,14 @@ impl Drop for BtleplugClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fact_byte_maps_both_states() {
+        assert_eq!(fact_byte(false), FACT_INTACT);
+        assert_eq!(fact_byte(true), FACT_BROKEN);
+        assert_eq!(FACT_INTACT, 0x00);
+        assert_eq!(FACT_BROKEN, 0x01);
+    }
 
     #[test]
     fn connects_on_matching_address_within_bound() {

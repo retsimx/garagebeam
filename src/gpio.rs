@@ -216,6 +216,24 @@ mod tests {
     }
 
     #[test]
+    fn refractory_window_boundary_suppresses_inside_accepts_at_window() {
+        let mut debouncer = BeamDebouncer::new(REFRACTORY);
+        let t0 = tokio::time::Instant::now();
+        let cases = [
+            (0, EdgeDecision::Accept),
+            (19, EdgeDecision::Suppress),
+            (20, EdgeDecision::Accept),
+        ];
+        for (ms, expected) in cases {
+            assert_eq!(
+                debouncer.on_edge(at(t0, ms)),
+                expected,
+                "edge at t0+{ms} ms"
+            );
+        }
+    }
+
+    #[test]
     fn remaining_counts_down_within_window() {
         let mut debouncer = BeamDebouncer::new(REFRACTORY);
         let t0 = tokio::time::Instant::now();
@@ -236,15 +254,15 @@ mod tests {
     fn refractory_resample_semantics() {
         let mut debouncer = BeamDebouncer::new(REFRACTORY);
         let t0 = tokio::time::Instant::now();
-        debouncer.on_edge(t0);
+        assert_eq!(debouncer.on_edge(t0), EdgeDecision::Accept);
         assert!(!debouncer.window_expired(at(t0, 19)));
         assert!(debouncer.window_expired(at(t0, 20)));
 
-        // After expiry a changed sample is adopted, an unchanged one is a no-op.
-        let latched = level_to_fact(Level::Low, BEAM_ACTIVE_LOW);
-        let changed = level_to_fact(Level::High, BEAM_ACTIVE_LOW);
-        assert_ne!(changed, latched);
-        assert_eq!(level_to_fact(Level::Low, BEAM_ACTIVE_LOW), latched);
+        // The re-sample fires once the window has elapsed; accepting the
+        // re-sampled edge re-anchors a fresh refractory window.
+        assert_eq!(debouncer.on_edge(at(t0, 20)), EdgeDecision::Accept);
+        assert!(!debouncer.window_expired(at(t0, 39)));
+        assert!(debouncer.window_expired(at(t0, 40)));
     }
 
     #[test]
@@ -253,5 +271,18 @@ mod tests {
         assert!(!level_to_fact(Level::High, true));
         assert!(!level_to_fact(Level::Low, false));
         assert!(level_to_fact(Level::High, false));
+    }
+
+    #[test]
+    fn startup_sample_maps_sampled_value_to_fact() {
+        // The startup level comes from a raw line sample, not an edge direction.
+        let cases = [
+            (Value::Inactive, Level::Low, true),
+            (Value::Active, Level::High, false),
+        ];
+        for (value, level, fact) in cases {
+            assert_eq!(value_to_level(value), level);
+            assert_eq!(level_to_fact(value_to_level(value), BEAM_ACTIVE_LOW), fact);
+        }
     }
 }

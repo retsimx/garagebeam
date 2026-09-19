@@ -17,18 +17,34 @@ pub enum WriteDecision {
     Write(bool),
 }
 
-/// Pure write schedule. `last_sent == None` means the characteristic has been
-/// resolved but no fact has been delivered yet (resync on connect).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionEvent {
+    Connected,
+    Steady,
+}
+
+/// Pure write schedule. `ConnectionEvent::Connected` always writes the current
+/// fact (the resync after every (re)connect); `Steady` writes on a fact change
+/// or when the silent keepalive is due since `last_write`.
 pub fn schedule_write(
-    last_sent: Option<bool>,
-    current: bool,
-    keepalive_due: bool,
+    event: ConnectionEvent,
+    last_fact: Option<bool>,
+    last_write: Option<tokio::time::Instant>,
+    fact: bool,
+    now: tokio::time::Instant,
 ) -> WriteDecision {
-    match last_sent {
-        None => WriteDecision::Write(current),
-        Some(previous) if previous != current => WriteDecision::Write(current),
-        _ if keepalive_due => WriteDecision::Write(current),
-        _ => WriteDecision::Idle,
+    match event {
+        ConnectionEvent::Connected => WriteDecision::Write(fact),
+        ConnectionEvent::Steady => {
+            let changed = last_fact != Some(fact);
+            let keepalive_due =
+                last_write.is_none_or(|t| now.saturating_duration_since(t) >= KEEPALIVE);
+            if changed || keepalive_due {
+                WriteDecision::Write(fact)
+            } else {
+                WriteDecision::Idle
+            }
+        }
     }
 }
 
@@ -48,18 +64,22 @@ pub async fn run_loop(
     }
 
     let mut fact = level_to_fact(reader.read_level()?, BEAM_ACTIVE_LOW);
-    let mut last_sent: Option<bool> = None;
-    if let WriteDecision::Write(value) = schedule_write(last_sent, fact, false) {
+    let mut last_fact: Option<bool> = None;
+    let mut last_write: Option<tokio::time::Instant> = None;
+    let now = tokio::time::Instant::now();
+    if let WriteDecision::Write(value) =
+        schedule_write(ConnectionEvent::Connected, None, last_write, fact, now)
+    {
         client.write_state(value).await?;
-        last_sent = Some(value);
+        last_fact = Some(value);
+        last_write = Some(now);
     }
 
-    let mut keepalive =
-        tokio::time::interval_at(tokio::time::Instant::now() + KEEPALIVE, KEEPALIVE);
     let mut debouncer = BeamDebouncer::new(REFRACTORY);
 
     loop {
         let now = tokio::time::Instant::now();
+        let deadline = last_write.map_or_else(tokio::time::Instant::now, |t| t + KEEPALIVE);
         let edge = {
             let edge_wait = async {
                 match debouncer.remaining(now) {
@@ -70,21 +90,37 @@ pub async fn run_loop(
                 }
             };
             tokio::pin!(edge_wait);
-            // Unbiased: a continuously-ready edge must not starve the tick.
+            // Unbiased: a continuously-ready edge must not starve the keepalive.
             tokio::select! {
                 edge = &mut edge_wait => edge,
                 result = client.wait_for_reconnect() => {
                     result?;
-                    if let WriteDecision::Write(value) = schedule_write(None, fact, false) {
+                    let now = tokio::time::Instant::now();
+                    if let WriteDecision::Write(value) = schedule_write(
+                        ConnectionEvent::Connected,
+                        None,
+                        last_write,
+                        fact,
+                        now,
+                    ) {
                         client.write_state(value).await?;
-                        last_sent = Some(value);
+                        last_fact = Some(value);
+                        last_write = Some(now);
                     }
                     continue;
                 }
-                _ = keepalive.tick() => {
-                    if let WriteDecision::Write(value) = schedule_write(last_sent, fact, true) {
+                _ = tokio::time::sleep_until(deadline) => {
+                    let now = tokio::time::Instant::now();
+                    if let WriteDecision::Write(value) = schedule_write(
+                        ConnectionEvent::Steady,
+                        last_fact,
+                        last_write,
+                        fact,
+                        now,
+                    ) {
                         client.write_state(value).await?;
-                        last_sent = Some(value);
+                        last_fact = Some(value);
+                        last_write = Some(now);
                     }
                     continue;
                 }
@@ -101,9 +137,12 @@ pub async fn run_loop(
                         "accepted beam edge"
                     );
                     fact = level_to_fact(edge.level, BEAM_ACTIVE_LOW);
-                    if let WriteDecision::Write(value) = schedule_write(last_sent, fact, false) {
+                    if let WriteDecision::Write(value) =
+                        schedule_write(ConnectionEvent::Steady, last_fact, last_write, fact, now)
+                    {
                         client.write_state(value).await?;
-                        last_sent = Some(value);
+                        last_fact = Some(value);
+                        last_write = Some(now);
                     }
                 }
             }
@@ -112,9 +151,12 @@ pub async fn run_loop(
                 let now = tokio::time::Instant::now();
                 if debouncer.window_expired(now) {
                     fact = level_to_fact(reader.read_level()?, BEAM_ACTIVE_LOW);
-                    if let WriteDecision::Write(value) = schedule_write(last_sent, fact, false) {
+                    if let WriteDecision::Write(value) =
+                        schedule_write(ConnectionEvent::Steady, last_fact, last_write, fact, now)
+                    {
                         client.write_state(value).await?;
-                        last_sent = Some(value);
+                        last_fact = Some(value);
+                        last_write = Some(now);
                     }
                 }
             }
@@ -573,63 +615,101 @@ mod tests {
         assert_eq!(res.unwrap_err().to_string(), "stop");
     }
 
-    #[test]
-    fn schedule_write_resyncs_on_connect() {
+    #[tokio::test(start_paused = true)]
+    async fn schedule_write_resyncs_on_connect() {
+        let t0 = tokio::time::Instant::now();
         assert_eq!(
-            schedule_write(None, true, false),
+            schedule_write(ConnectionEvent::Connected, None, None, true, t0),
             WriteDecision::Write(true)
         );
     }
 
-    #[test]
-    fn schedule_write_resync_wins_over_keepalive() {
+    #[tokio::test(start_paused = true)]
+    async fn schedule_write_resync_wins_over_keepalive() {
+        let t0 = tokio::time::Instant::now();
         assert_eq!(
-            schedule_write(None, false, true),
+            schedule_write(
+                ConnectionEvent::Connected,
+                Some(false),
+                Some(t0),
+                false,
+                t0 + KEEPALIVE * 10,
+            ),
             WriteDecision::Write(false)
         );
     }
 
-    #[test]
-    fn schedule_write_writes_on_change() {
+    #[tokio::test(start_paused = true)]
+    async fn schedule_write_writes_on_change() {
+        let t0 = tokio::time::Instant::now();
         assert_eq!(
-            schedule_write(Some(false), true, false),
+            schedule_write(ConnectionEvent::Steady, Some(false), Some(t0), true, t0),
             WriteDecision::Write(true)
         );
     }
 
-    #[test]
-    fn schedule_write_writes_on_change_down() {
+    #[tokio::test(start_paused = true)]
+    async fn schedule_write_writes_on_change_down() {
+        let t0 = tokio::time::Instant::now();
         assert_eq!(
-            schedule_write(Some(true), false, false),
+            schedule_write(ConnectionEvent::Steady, Some(true), Some(t0), false, t0),
             WriteDecision::Write(false)
         );
     }
 
-    #[test]
-    fn schedule_write_idle_when_unchanged() {
-        assert_eq!(schedule_write(Some(true), true, false), WriteDecision::Idle);
-    }
-
-    #[test]
-    fn schedule_write_idle_when_unchanged_false() {
+    #[tokio::test(start_paused = true)]
+    async fn schedule_write_idle_when_unchanged() {
+        let t0 = tokio::time::Instant::now();
         assert_eq!(
-            schedule_write(Some(false), false, false),
+            schedule_write(ConnectionEvent::Steady, Some(true), Some(t0), true, t0),
             WriteDecision::Idle
         );
     }
 
-    #[test]
-    fn schedule_write_keepalive_when_due() {
+    #[tokio::test(start_paused = true)]
+    async fn schedule_write_idle_when_unchanged_false() {
+        let t0 = tokio::time::Instant::now();
         assert_eq!(
-            schedule_write(Some(true), true, true),
+            schedule_write(ConnectionEvent::Steady, Some(false), Some(t0), false, t0),
+            WriteDecision::Idle
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn schedule_write_keepalive_when_due() {
+        let t0 = tokio::time::Instant::now();
+        assert_eq!(
+            schedule_write(
+                ConnectionEvent::Steady,
+                Some(true),
+                Some(t0),
+                true,
+                t0 + KEEPALIVE,
+            ),
             WriteDecision::Write(true)
         );
     }
 
-    #[test]
-    fn schedule_write_change_beats_coincident_keepalive() {
+    #[tokio::test(start_paused = true)]
+    async fn schedule_write_change_beats_coincident_keepalive() {
+        let t0 = tokio::time::Instant::now();
         assert_eq!(
-            schedule_write(Some(false), true, true),
+            schedule_write(
+                ConnectionEvent::Steady,
+                Some(false),
+                Some(t0),
+                true,
+                t0 + KEEPALIVE,
+            ),
+            WriteDecision::Write(true)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn schedule_write_steady_without_last_write_is_keepalive_due() {
+        let t0 = tokio::time::Instant::now();
+        assert_eq!(
+            schedule_write(ConnectionEvent::Steady, Some(true), None, true, t0),
             WriteDecision::Write(true)
         );
     }

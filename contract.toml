@@ -1,0 +1,21 @@
+# Cross-repo contract: vendored byte-identically in retsimx/garagebeam and
+# asserted against the code constants in core/src/contract.rs by a host test.
+schema = 1
+
+# BLE GATT contract
+service_uuid = "6a4c0001-b5a3-4f1e-9c2d-7e8f9a0b1c2d"
+characteristic_uuid = "6a4c0002-b5a3-4f1e-9c2d-7e8f9a0b1c2d"
+value_len_bytes = 1
+fact_intact = 0
+fact_broken = 1
+initial_read_value = 0
+
+# Connection / liveness contract
+conn_interval_us = 7500
+conn_slave_latency = 0
+conn_supervision_timeout_ms = 1000
+keepalive_interval_ms = 10000
+leash_timeout_ms = 30000
+
+# Telemetry contract
+mqtt_topic = "garage/temperature"

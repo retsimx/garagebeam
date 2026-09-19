@@ -34,6 +34,24 @@ Use [cross](https://github.com/cross-rs/cross):
 cross build --target arm-unknown-linux-musleabihf --release
 ```
 
+## Testing and CI
+
+The project follows one rule: **policy is tested on the host in CI; hardware is
+tested on the bench.** Pure decisions — beam debounce, write scheduling, and
+reconnect policy — run as ordinary `cargo test` cases with no hardware attached,
+so the host suite passes on any machine.
+
+CI runs the same checks on every push and pull request:
+
+- `cargo fmt --all --check` and `cargo clippy --all-targets -- -D warnings`
+- the host `cargo test` suite, hardware-free
+- the ARM release cross build (`arm-unknown-linux-musleabihf`)
+- `shellcheck` over the OpenRC service script (`deploy.sh` too, when present)
+- a cross-repo byte-equality check of `contract.toml` against the sibling firmware
+
+See [`.github/workflows/ci.yml`](.github/workflows/ci.yml) for the exact steps.
+Radio and timing behaviour is verified on the bench rather than in CI.
+
 ## Service
 
 An OpenRC init script is provided (`garage_beam.openrc`). Adjust to `/etc/init.d/garage_beam`.
