@@ -1,16 +1,25 @@
 #!/sbin/openrc-run
+# shellcheck shell=sh disable=SC2034,SC1090
 
 name="garage_beam"
 description="Garage Beam BLE Bridge"
-command="/root/garage_beam/garage_beam"
+
+[ -r "/etc/conf.d/${RC_SVCNAME}" ] && . "/etc/conf.d/${RC_SVCNAME}"
+[ -n "${GARAGE_BEAM_DEVICE_ADDRESS:-}" ] && export GARAGE_BEAM_DEVICE_ADDRESS
+
+: "${command:=/root/garage_beam/garage_beam}"
+: "${directory:=/root/garage_beam}"
+
 command_background="yes"
-directory="/root/garage_beam"
 pidfile="/run/${RC_SVCNAME}.pid"
 output_log="/var/log/garage_beam.log"
 error_log="/var/log/garage_beam.log"
 
-export RUST_LOG=info
+: "${RUST_LOG:=garage_beam=info,warn}"
+export RUST_LOG
 
+# Service isolation: garage_beam is independent; no other service may declare
+# `need garage_beam` (use `use`/`after` for ordering only).
 depend() {
     need dbus bluetooth
     after net
