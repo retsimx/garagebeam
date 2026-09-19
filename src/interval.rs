@@ -120,7 +120,7 @@ fn le_update_complete_event(evt: &[u8]) -> Option<(u16, u8, u16)> {
     decode_update_complete(&compact)
 }
 
-fn decode_monitor_interval(frame: &[u8]) -> Option<u16> {
+fn decode_monitor_interval(frame: &[u8]) -> Option<(u16, u16)> {
     if frame.len() < HCI_MON_HDR_SIZE {
         return None;
     }
@@ -133,7 +133,14 @@ fn decode_monitor_interval(frame: &[u8]) -> Option<u16> {
         return None;
     }
     let evt = &frame[HCI_MON_HDR_SIZE..HCI_MON_HDR_SIZE + len];
-    le_update_complete_event(evt).map(|(_, _, interval)| interval)
+    le_update_complete_event(evt).map(|(handle, _, interval)| (handle, interval))
+}
+
+fn targeted_interval(our_handle: u16, frame: &[u8]) -> Option<u16> {
+    match decode_monitor_interval(frame) {
+        Some((handle, interval)) if handle == our_handle => Some(interval),
+        _ => None,
+    }
 }
 
 #[cfg_attr(test, automock)]
@@ -228,13 +235,19 @@ impl IntervalControl for HciInterval {
             Ok(slot) => slot,
             Err(_) => return Err(anyhow!("interval guard mutex poisoned")),
         };
+        let handle = {
+            let raw = open_raw_socket()?;
+            let resolved = find_connection_handle(raw, &self.address);
+            unsafe { libc::close(raw) };
+            resolved?
+        };
         let fd = open_monitor_socket()?;
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let address = self.address.clone();
         let thread = match std::thread::Builder::new()
             .name("hci-interval-guard".to_string())
-            .spawn(move || guard_loop(fd, address, thread_stop))
+            .spawn(move || guard_loop(fd, handle, address, thread_stop))
         {
             Ok(thread) => thread,
             Err(e) => {
@@ -502,7 +515,7 @@ fn send_connection_update(fd: RawFd, handle: u16) -> Result<()> {
     }
 }
 
-fn guard_loop(fd: RawFd, address: String, stop: Arc<AtomicBool>) {
+fn guard_loop(fd: RawFd, handle: u16, address: String, stop: Arc<AtomicBool>) {
     let mut last_attempt: Option<Instant> = None;
     let mut buf = [0u8; 4096];
     while !stop.load(Ordering::Relaxed) {
@@ -530,7 +543,7 @@ fn guard_loop(fd: RawFd, address: String, stop: Arc<AtomicBool>) {
             );
             break;
         }
-        let Some(interval) = decode_monitor_interval(&buf[..n as usize]) else {
+        let Some(interval) = targeted_interval(handle, &buf[..n as usize]) else {
             continue;
         };
         if should_reapply(interval, last_attempt, Instant::now()) == IntervalDecision::Apply {
@@ -619,7 +632,15 @@ mod tests {
     fn decode_monitor_interval_reads_connection_update_complete() {
         let mut frame = vec![0x03, 0x00, 0x00, 0x00, 0x08, 0x00];
         frame.extend_from_slice(&[0x3e, 0x06, 0x03, 0x00, 0x40, 0x00, 0x06, 0x00]);
-        assert_eq!(decode_monitor_interval(&frame), Some(0x0006));
+        assert_eq!(decode_monitor_interval(&frame), Some((0x0040, 0x0006)));
+    }
+
+    #[test]
+    fn targeted_interval_selects_only_our_handle() {
+        let mut frame = vec![0x03, 0x00, 0x00, 0x00, 0x08, 0x00];
+        frame.extend_from_slice(&[0x3e, 0x06, 0x03, 0x00, 0x40, 0x00, 0x06, 0x00]);
+        assert_eq!(targeted_interval(0x0040, &frame), Some(0x0006));
+        assert_eq!(targeted_interval(0x0041, &frame), None);
     }
 
     #[test]
