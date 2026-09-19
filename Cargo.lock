@@ -336,6 +336,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "btleplug",
+ "futures",
  "gpiocdev",
  "libc",
  "libdbus-sys",
