@@ -1,17 +1,27 @@
 pub mod ble;
 pub mod gpio;
+pub mod interval;
 
 use anyhow::Result;
 use ble::BleClient;
 use gpio::{level_to_fact, BeamDebouncer, EdgeDecision, GpioReader, BEAM_ACTIVE_LOW, REFRACTORY};
-use tracing::info;
+use interval::IntervalControl;
+use tracing::{info, warn};
 
 pub async fn run_loop(
     mut client: Box<dyn BleClient>,
     mut reader: Box<dyn GpioReader>,
+    interval: Box<dyn IntervalControl>,
 ) -> Result<()> {
     client.connect().await?;
     info!("Connected successfully!");
+
+    if let Err(e) = interval.enforce().await {
+        warn!("interval enforcement failed: {e:#}");
+    }
+    if let Err(e) = interval.start_guard() {
+        warn!("interval guard unavailable: {e:#}");
+    }
 
     let mut fact = level_to_fact(reader.read_level()?, BEAM_ACTIVE_LOW);
     client.write_state(fact).await?;
@@ -64,6 +74,7 @@ mod tests {
     use super::*;
     use crate::ble::MockBleClient;
     use crate::gpio::{GpioEdge, Level, MockGpioReader};
+    use crate::interval::MockIntervalControl;
     use async_trait::async_trait;
     use mockall::predicate::eq;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -75,6 +86,13 @@ mod tests {
             level,
             timestamp_ns: 42,
         }
+    }
+
+    fn passing_interval() -> MockIntervalControl {
+        let mut interval = MockIntervalControl::new();
+        interval.expect_enforce().times(1).returning(|| Ok(()));
+        interval.expect_start_guard().times(1).returning(|| Ok(()));
+        interval
     }
 
     #[tokio::test]
@@ -95,7 +113,12 @@ mod tests {
             .times(1)
             .returning(|| Err(anyhow::anyhow!("stop")));
 
-        let res = run_loop(Box::new(client), Box::new(gpio)).await;
+        let res = run_loop(
+            Box::new(client),
+            Box::new(gpio),
+            Box::new(passing_interval()),
+        )
+        .await;
         assert_eq!(res.unwrap_err().to_string(), "stop");
     }
 
@@ -127,7 +150,12 @@ mod tests {
             .times(1)
             .returning(|_| Ok(()));
 
-        let res = run_loop(Box::new(client), Box::new(gpio)).await;
+        let res = run_loop(
+            Box::new(client),
+            Box::new(gpio),
+            Box::new(passing_interval()),
+        )
+        .await;
         assert_eq!(res.unwrap_err().to_string(), "stop");
     }
 
@@ -162,7 +190,12 @@ mod tests {
             .times(1)
             .returning(|_| Ok(()));
 
-        let res = run_loop(Box::new(client), Box::new(gpio)).await;
+        let res = run_loop(
+            Box::new(client),
+            Box::new(gpio),
+            Box::new(passing_interval()),
+        )
+        .await;
         assert_eq!(res.unwrap_err().to_string(), "stop");
     }
 
@@ -218,8 +251,109 @@ mod tests {
             wait_for_edge_calls: Arc::clone(&wait_for_edge_calls),
         };
 
-        let res = run_loop(Box::new(client), Box::new(gpio)).await;
+        let res = run_loop(
+            Box::new(client),
+            Box::new(gpio),
+            Box::new(passing_interval()),
+        )
+        .await;
         assert_eq!(res.unwrap_err().to_string(), "stop");
         assert_eq!(read_level_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn startup_connect_enforce_guard_before_first_write() {
+        let mut sequence = mockall::Sequence::new();
+        let mut client = MockBleClient::new();
+        let mut gpio = MockGpioReader::new();
+        let mut interval = MockIntervalControl::new();
+
+        client
+            .expect_connect()
+            .times(1)
+            .in_sequence(&mut sequence)
+            .returning(|| Ok(()));
+        interval
+            .expect_enforce()
+            .times(1)
+            .in_sequence(&mut sequence)
+            .returning(|| Ok(()));
+        interval
+            .expect_start_guard()
+            .times(1)
+            .in_sequence(&mut sequence)
+            .returning(|| Ok(()));
+        client
+            .expect_write_state()
+            .with(eq(true))
+            .times(1)
+            .in_sequence(&mut sequence)
+            .returning(|_| Ok(()));
+        gpio.expect_read_level()
+            .times(1)
+            .returning(|| Ok(Level::Low));
+        gpio.expect_wait_for_edge()
+            .times(1)
+            .returning(|| Err(anyhow::anyhow!("stop")));
+
+        let res = run_loop(Box::new(client), Box::new(gpio), Box::new(interval)).await;
+        assert_eq!(res.unwrap_err().to_string(), "stop");
+    }
+
+    #[tokio::test]
+    async fn enforce_error_does_not_abort_run_loop() {
+        let mut client = MockBleClient::new();
+        let mut gpio = MockGpioReader::new();
+        let mut interval = MockIntervalControl::new();
+
+        client.expect_connect().times(1).returning(|| Ok(()));
+        interval.expect_enforce().times(1).returning(|| {
+            Err(anyhow::anyhow!(
+                "LE Connection Update rejected, status 0x3a"
+            ))
+        });
+        interval.expect_start_guard().times(1).returning(|| Ok(()));
+        client
+            .expect_write_state()
+            .with(eq(true))
+            .times(1)
+            .returning(|_| Ok(()));
+        gpio.expect_read_level()
+            .times(1)
+            .returning(|| Ok(Level::Low));
+        gpio.expect_wait_for_edge()
+            .times(1)
+            .returning(|| Err(anyhow::anyhow!("stop")));
+
+        let res = run_loop(Box::new(client), Box::new(gpio), Box::new(interval)).await;
+        assert_eq!(res.unwrap_err().to_string(), "stop");
+    }
+
+    #[tokio::test]
+    async fn start_guard_error_does_not_abort_run_loop() {
+        let mut client = MockBleClient::new();
+        let mut gpio = MockGpioReader::new();
+        let mut interval = MockIntervalControl::new();
+
+        client.expect_connect().times(1).returning(|| Ok(()));
+        interval.expect_enforce().times(1).returning(|| Ok(()));
+        interval
+            .expect_start_guard()
+            .times(1)
+            .returning(|| Err(anyhow::anyhow!("bind HCI monitor socket: EINVAL")));
+        client
+            .expect_write_state()
+            .with(eq(true))
+            .times(1)
+            .returning(|_| Ok(()));
+        gpio.expect_read_level()
+            .times(1)
+            .returning(|| Ok(Level::Low));
+        gpio.expect_wait_for_edge()
+            .times(1)
+            .returning(|| Err(anyhow::anyhow!("stop")));
+
+        let res = run_loop(Box::new(client), Box::new(gpio), Box::new(interval)).await;
+        assert_eq!(res.unwrap_err().to_string(), "stop");
     }
 }
