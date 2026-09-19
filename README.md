@@ -37,3 +37,51 @@ cross build --target arm-unknown-linux-musleabihf --release
 ## Service
 
 An OpenRC init script is provided (`garage_beam.openrc`). Adjust to `/etc/init.d/garage_beam`.
+
+## Operations
+
+### Service relationship
+
+`garage_beam` and `rshunterbtt` are independent OpenRC services. Restarting
+either must leave the other running.
+
+A historical outage in which restarting `garage_beam` also stopped `rshunterbtt`
+was diagnosed to the deployed host `/etc/init.d/rshunterbtt`, which declared
+`need dbus bluetooth garage_beam`. OpenRC `need` is a strong dependency: stopping
+the needed service stops its dependents, and `rc-service -Z garage_beam restart`
+proved the cascade. The deployed script has since been restored to its committed
+upstream form, and `garage_beam` now has its own `default` runlevel entry.
+
+Do not add any cross-service declaration to `garage_beam.openrc`; use
+`use`/`after` for ordering only.
+
+### Single clone
+
+Exactly one authoritative checkout of this repository — the repository working
+tree — builds every deployed binary. Deployed binaries are built from that clone
+only, and duplicate checkouts are retired.
+
+### Environment variables
+
+| Variable | Required | Default | Source |
+|---|---|---|---|
+| `GARAGE_BEAM_DEVICE_ADDRESS` | yes | none | `/etc/conf.d/garage_beam` (untracked host config) |
+| `RUST_LOG` | no | `garage_beam=info,warn` | operator environment or `/etc/conf.d/garage_beam` |
+
+- `GARAGE_BEAM_DEVICE_ADDRESS` is the lamp peripheral's BLE address. It has no
+  committed default because this repository is public; the value lives only in
+  the untracked host config.
+- `RUST_LOG` defaults to `garage_beam=info,warn`, which keeps steady state
+  silent; an operator can raise it when diagnosing.
+
+`garage_beam.openrc` sources `/etc/conf.d/garage_beam` when present and lets it
+override the command and working directory.
+
+### Host LE connection interval
+
+Keep `[LE] MinConnectionInterval=6` and `MaxConnectionInterval=6` in
+`/etc/bluetooth/main.conf`. The host-wide value makes every new LE connection
+start at the 7.5 ms minimum, so the lamp link comes up fast before the explicit
+`LE Connection Update` lands; the sprinkler bridge `rshunterbtt` requests and
+enforces its own interval at runtime and is unaffected. Do not remove this value
+as "cleanup" — see design doc 006 (host LE interval).
