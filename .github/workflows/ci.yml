@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  host:
+    name: host (fmt, clippy, tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.85.0
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy (all targets, warnings denied)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Host tests
+        run: cargo test
+
+  arm:
+    name: arm (cross release build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.85.0
+
+      - name: Install cross
+        uses: taiki-e/install-action@cross
+
+      - name: Cross release build (arm-unknown-linux-musleabihf)
+        run: cross build --release --target arm-unknown-linux-musleabihf
+
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Lint shell tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          files="garage_beam.openrc"
+          if [ -f deploy.sh ]; then files="$files deploy.sh"; fi
+          # shellcheck disable=SC2086
+          shellcheck $files
+
+  contract:
+    name: contract (cross-repo byte equality)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare contract.toml with the sibling repo
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL=https://raw.githubusercontent.com/retsimx/garagelight/main/contract.toml
+          code=$(curl -s -o /tmp/peer-contract.toml -w "%{http_code}" "$URL")
+          if [ "$code" = "404" ]; then
+            echo "::warning::sibling contract.toml not found (HTTP 404) - skipping byte-equality check (bootstrap)"
+            exit 0
+          fi
+          if [ "$code" != "200" ]; then echo "::error::unexpected HTTP $code fetching $URL"; exit 1; fi
+          cmp -s contract.toml /tmp/peer-contract.toml || { echo "::error::contract.toml differs from sibling"; diff -u contract.toml /tmp/peer-contract.toml; exit 1; }
