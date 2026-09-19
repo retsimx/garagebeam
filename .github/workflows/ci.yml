@@ -67,6 +67,7 @@ jobs:
           set -euo pipefail
           files="garage_beam.openrc"
           if [ -f deploy.sh ]; then files="$files deploy.sh"; fi
+          if [ -f scripts/latency_report.sh ]; then files="$files scripts/latency_report.sh"; fi
           # shellcheck disable=SC2086
           shellcheck $files
 

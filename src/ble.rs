@@ -27,6 +27,10 @@ use mockall::{automock, predicate::*};
 pub trait BleClient: Send + Sync {
     async fn connect(&mut self) -> Result<()>;
     async fn write_state(&self, state: bool) -> Result<()>;
+    /// Measurement-only read of the 1-byte fact characteristic. This is not
+    /// part of the control path: it exists solely to sample write-to-read
+    /// latency and must never gate or alter a write decision.
+    async fn read_state(&self) -> Result<u8>;
     /// Resolves the next time a fresh connection is established after the one
     /// `connect()` returned. Never resolves for the already-observed link.
     async fn wait_for_reconnect(&self) -> Result<()>;
@@ -407,6 +411,28 @@ impl BleClient for BtleplugClient {
             return Err(e).context("Failed to write to state characteristic");
         }
         Ok(())
+    }
+
+    async fn read_state(&self) -> Result<u8> {
+        let target = {
+            let connection = self.connection.lock().unwrap();
+            connection.as_ref().map(|connection| {
+                (
+                    connection.peripheral.clone(),
+                    connection.characteristic.clone(),
+                )
+            })
+        };
+        let (peripheral, characteristic) = target.ok_or_else(|| anyhow!("not connected"))?;
+
+        let value = peripheral
+            .read(&characteristic)
+            .await
+            .context("Failed to read state characteristic")?;
+        value
+            .first()
+            .copied()
+            .ok_or_else(|| anyhow!("state characteristic returned no bytes"))
     }
 
     async fn wait_for_reconnect(&self) -> Result<()> {
