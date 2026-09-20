@@ -48,7 +48,7 @@ fn contract_matches_code_constants() {
         num("conn_supervision_timeout_ms"),
         garage_beam::interval::SUPERVISION_TIMEOUT as u64 * 10
     );
-    assert_eq!(num("conn_supervision_timeout_ms"), 1000);
+    assert_eq!(num("conn_supervision_timeout_ms"), 8000);
     assert_eq!(
         num("keepalive_interval_ms"),
         garage_beam::KEEPALIVE.as_millis() as u64
