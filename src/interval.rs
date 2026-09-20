@@ -48,7 +48,7 @@ const GUARD_POLL_TIMEOUT_MS: i32 = 500;
 
 pub const TARGET_INTERVAL: u16 = 0x0006; // 7.5 ms in 1.25 ms units
 pub const SLAVE_LATENCY: u16 = 0;
-pub const SUPERVISION_TIMEOUT: u16 = 0x0064; // 1000 ms in 10 ms units
+pub const SUPERVISION_TIMEOUT: u16 = 0x0320; // 8000 ms in 10 ms units
 pub const REAPPLY_RATE_LIMIT: Duration = Duration::from_secs(3);
 
 // The kernel `hci_cp_le_conn_update` is 14 bytes; the trailing CE-length fields
@@ -604,7 +604,7 @@ mod tests {
     fn conn_update_params_serialises_exact_block() {
         assert_eq!(
             conn_update_params(0x0040),
-            [0x40, 0x00, 0x06, 0x00, 0x06, 0x00, 0x00, 0x00, 0x64, 0x00, 0x01, 0x00, 0x01, 0x00,]
+            [0x40, 0x00, 0x06, 0x00, 0x06, 0x00, 0x00, 0x00, 0x20, 0x03, 0x01, 0x00, 0x01, 0x00,]
         );
     }
 

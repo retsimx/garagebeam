@@ -13,7 +13,7 @@ initial_read_value = 0
 # Connection / liveness contract
 conn_interval_us = 7500
 conn_slave_latency = 0
-conn_supervision_timeout_ms = 1000
+conn_supervision_timeout_ms = 8000
 keepalive_interval_ms = 10000
 leash_timeout_ms = 30000
 

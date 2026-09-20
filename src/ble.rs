@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -7,8 +8,8 @@ use std::time::Duration;
 use btleplug::api::{
     Central, CentralEvent, Characteristic, Manager as _, Peripheral as _, ScanFilter, WriteType,
 };
-use btleplug::platform::{Manager, Peripheral};
-use futures::StreamExt;
+use btleplug::platform::{Adapter, Manager, Peripheral};
+use futures::{Stream, StreamExt};
 use tokio::sync::{mpsc, watch};
 
 pub const SERVICE_UUID: &str = "6a4c0001-b5a3-4f1e-9c2d-7e8f9a0b1c2d";
@@ -18,6 +19,13 @@ pub const FACT_BROKEN: u8 = 0x01;
 pub const CONNECT_BOUND: Duration = Duration::from_secs(30);
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
 const BACKOFF_MAX_SHIFT: u32 = 3;
+/// Consecutive failed acquisitions (a scan window that produced no connection)
+/// before the supervisor tears down and rebuilds the BlueZ session. A stalled
+/// adapter can stop delivering discovery events indefinitely, so rebuilding the
+/// `Manager`, adapter, and event stream is the only in-process recovery.
+const MAX_ATTEMPTS_BEFORE_REINIT: u32 = 5;
+
+type CentralEventStream = Pin<Box<dyn Stream<Item = CentralEvent> + Send>>;
 
 #[cfg(test)]
 use mockall::{automock, predicate::*};
@@ -57,6 +65,13 @@ pub fn connect_decision(configured: &str, candidate: &str, elapsed: Duration) ->
 
 pub fn backoff_delay(attempt: u32) -> Duration {
     BACKOFF_BASE * (1u32 << attempt.min(BACKOFF_MAX_SHIFT))
+}
+
+/// Whether `failed_attempts` consecutive failed acquisitions should trigger a
+/// full BlueZ session rebuild (manager, adapter, and event stream) instead of
+/// another backoff-and-rescan on the same adapter.
+pub fn should_reinit(failed_attempts: u32) -> bool {
+    failed_attempts >= MAX_ATTEMPTS_BEFORE_REINIT
 }
 
 pub fn fact_byte(state: bool) -> u8 {
@@ -171,6 +186,30 @@ async fn connect_peripheral(peripheral: &Peripheral) -> Result<Characteristic> {
         .ok_or_else(|| anyhow!("Characteristic {CHARACTERISTIC_UUID} not found"))
 }
 
+/// Build a fresh BlueZ session: manager, first adapter, and the adapter's event
+/// stream. Factored out so the supervisor can rebuild all three when the
+/// adapter/scan stalls. The returned adapter owns a clone of the manager's
+/// session, so the manager itself does not need to be retained.
+async fn setup_central() -> Result<(Adapter, CentralEventStream)> {
+    let manager = Manager::new()
+        .await
+        .context("failed to create BlueZ manager")?;
+    let central = manager
+        .adapters()
+        .await
+        .context("failed to enumerate adapters")?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("No Bluetooth adapter found"))?;
+    // Subscribe before any scan: BlueZ synthesises discovery events for known
+    // peripherals and replays them on a fresh subscription.
+    let events = central
+        .events()
+        .await
+        .context("failed to subscribe to adapter events")?;
+    Ok((central, events))
+}
+
 async fn supervise(
     mac_address: String,
     connection: Arc<Mutex<Option<Connection>>>,
@@ -178,38 +217,6 @@ async fn supervise(
     epoch: Arc<ConnectionEpoch>,
     mut reconnect_rx: mpsc::UnboundedReceiver<()>,
 ) {
-    let manager = match Manager::new().await {
-        Ok(manager) => manager,
-        Err(e) => {
-            let _ = status_tx.send_replace(LinkStatus::Fatal(e.to_string()));
-            return;
-        }
-    };
-    let central = match manager.adapters().await {
-        Ok(adapters) => match adapters.into_iter().next() {
-            Some(central) => central,
-            None => {
-                let _ = status_tx
-                    .send_replace(LinkStatus::Fatal("No Bluetooth adapter found".to_string()));
-                return;
-            }
-        },
-        Err(e) => {
-            let _ = status_tx.send_replace(LinkStatus::Fatal(e.to_string()));
-            return;
-        }
-    };
-
-    // Subscribe before any scan: BlueZ synthesises discovery events for known
-    // peripherals and replays them on a fresh subscription.
-    let mut events = match central.events().await {
-        Ok(events) => events,
-        Err(e) => {
-            let _ = status_tx.send_replace(LinkStatus::Fatal(e.to_string()));
-            return;
-        }
-    };
-
     let service_uuid = uuid::Uuid::parse_str(SERVICE_UUID).expect("valid service UUID");
     let filter = ScanFilter {
         services: vec![service_uuid],
@@ -217,121 +224,156 @@ async fn supervise(
 
     let mut attempt: u32 = 0;
 
-    loop {
-        let started = std::time::Instant::now();
-        let deadline = tokio::time::Instant::now() + CONNECT_BOUND;
-
-        let acquired = match central.start_scan(filter.clone()).await {
-            Ok(()) => {
-                let mut acquired = None;
-                loop {
-                    tokio::select! {
-                        _ = tokio::time::sleep_until(deadline) => break,
-                        event = events.next() => match event {
-                            Some(CentralEvent::DeviceDiscovered(id)) => {
-                                let peripheral = match central.peripheral(&id).await {
-                                    Ok(peripheral) => peripheral,
-                                    Err(_) => continue,
-                                };
-                                let address = peripheral.address().to_string();
-                                let elapsed = started.elapsed();
-                                match connect_decision(&mac_address, &address, elapsed) {
-                                    ConnectDecision::Connect => {
-                                        tracing::info!(
-                                            address = %address,
-                                            elapsed_ms = elapsed.as_millis() as u64,
-                                            "connecting to discovered peripheral"
-                                        );
-                                        match connect_peripheral(&peripheral).await {
-                                            Ok(characteristic) => {
-                                                acquired = Some((
-                                                    Connection {
-                                                        peripheral,
-                                                        characteristic,
-                                                    },
-                                                    id,
-                                                ));
-                                                break;
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    address = %address,
-                                                    error = %e,
-                                                    "connect attempt failed"
-                                                );
-                                                let _ = peripheral.disconnect().await;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    ConnectDecision::Wait => continue,
-                                    ConnectDecision::GiveUp => break,
-                                }
-                            }
-                            Some(_) => continue,
-                            None => {
-                                let _ = status_tx.send_replace(LinkStatus::Fatal(
-                                    "adapter event stream ended".to_string(),
-                                ));
-                                return;
-                            }
-                        }
-                    }
-                }
-                acquired
-            }
+    'reinit: loop {
+        let (central, mut events) = match setup_central().await {
+            Ok(pair) => pair,
             Err(e) => {
-                tracing::warn!(error = %e, "failed to start scan");
-                None
-            }
-        };
-
-        let _ = central.stop_scan().await;
-
-        let (connection_state, our_id) = match acquired {
-            Some(connection_state) => connection_state,
-            None => {
+                let _ = status_tx.send_replace(LinkStatus::Fatal(e.to_string()));
                 let delay = backoff_delay(attempt);
                 attempt = attempt.saturating_add(1);
                 tracing::info!(
                     retry_in_ms = delay.as_millis() as u64,
-                    "scan attempt failed; backing off"
+                    error = %e,
+                    "ble supervisor setup failed; backing off"
                 );
                 tokio::time::sleep(delay).await;
-                continue;
+                continue 'reinit;
             }
         };
-
+        // A fresh adapter and event stream start the acquisition run clean.
         attempt = 0;
-        *connection.lock().unwrap() = Some(connection_state);
-        epoch.advance();
-        let _ = status_tx.send_replace(LinkStatus::Connected);
-        // A write failure while the supervisor was still acquiring buffered a
-        // reconnect signal; drop it before entering Hold so it cannot tear down
-        // this fresh, healthy link.
-        while reconnect_rx.try_recv().is_ok() {}
 
         loop {
-            tokio::select! {
-                event = events.next() => match event {
-                    Some(CentralEvent::DeviceDisconnected(id)) if id == our_id => break,
-                    Some(_) => continue,
-                    None => {
-                        let _ = status_tx.send_replace(LinkStatus::Fatal(
-                            "adapter event stream ended".to_string(),
-                        ));
-                        return;
-                    }
-                },
-                Some(_) = reconnect_rx.recv() => break,
-            }
-        }
+            let started = std::time::Instant::now();
+            let deadline = tokio::time::Instant::now() + CONNECT_BOUND;
+            let mut stream_ended = false;
 
-        let connection_state = connection.lock().unwrap().take();
-        if let Some(connection_state) = connection_state {
-            let _ = connection_state.peripheral.disconnect().await;
+            let acquired = match central.start_scan(filter.clone()).await {
+                Ok(()) => {
+                    let mut acquired = None;
+                    loop {
+                        tokio::select! {
+                            _ = tokio::time::sleep_until(deadline) => break,
+                            event = events.next() => match event {
+                                Some(CentralEvent::DeviceDiscovered(id)) => {
+                                    let peripheral = match central.peripheral(&id).await {
+                                        Ok(peripheral) => peripheral,
+                                        Err(_) => continue,
+                                    };
+                                    let address = peripheral.address().to_string();
+                                    let elapsed = started.elapsed();
+                                    match connect_decision(&mac_address, &address, elapsed) {
+                                        ConnectDecision::Connect => {
+                                            tracing::info!(
+                                                address = %address,
+                                                elapsed_ms = elapsed.as_millis() as u64,
+                                                "connecting to discovered peripheral"
+                                            );
+                                            match connect_peripheral(&peripheral).await {
+                                                Ok(characteristic) => {
+                                                    acquired = Some((
+                                                        Connection {
+                                                            peripheral,
+                                                            characteristic,
+                                                        },
+                                                        id,
+                                                    ));
+                                                    break;
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        address = %address,
+                                                        error = %e,
+                                                        "connect attempt failed"
+                                                    );
+                                                    let _ = peripheral.disconnect().await;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        ConnectDecision::Wait => continue,
+                                        ConnectDecision::GiveUp => break,
+                                    }
+                                }
+                                Some(_) => continue,
+                                None => {
+                                    stream_ended = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    acquired
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to start scan");
+                    None
+                }
+            };
+
+            let _ = central.stop_scan().await;
+
+            if stream_ended {
+                let _ = status_tx
+                    .send_replace(LinkStatus::Fatal("adapter event stream ended".to_string()));
+                attempt = 0;
+                continue 'reinit;
+            }
+
+            let (connection_state, our_id) = match acquired {
+                Some(connection_state) => connection_state,
+                None => {
+                    let delay = backoff_delay(attempt);
+                    attempt = attempt.saturating_add(1);
+                    tracing::info!(
+                        retry_in_ms = delay.as_millis() as u64,
+                        "scan attempt failed; backing off"
+                    );
+                    tokio::time::sleep(delay).await;
+                    if should_reinit(attempt) {
+                        tracing::info!("ble_supervisor_reinit");
+                        attempt = 0;
+                        continue 'reinit;
+                    }
+                    continue;
+                }
+            };
+
+            attempt = 0;
+            *connection.lock().unwrap() = Some(connection_state);
+            epoch.advance();
+            let _ = status_tx.send_replace(LinkStatus::Connected);
+            // A write failure while the supervisor was still acquiring buffered a
+            // reconnect signal; drop it before entering Hold so it cannot tear down
+            // this fresh, healthy link.
+            while reconnect_rx.try_recv().is_ok() {}
+
+            loop {
+                tokio::select! {
+                    event = events.next() => match event {
+                        Some(CentralEvent::DeviceDisconnected(id)) if id == our_id => break,
+                        Some(_) => continue,
+                        None => {
+                            stream_ended = true;
+                            break;
+                        }
+                    },
+                    Some(_) = reconnect_rx.recv() => break,
+                }
+            }
+
+            let connection_state = connection.lock().unwrap().take();
+            if let Some(connection_state) = connection_state {
+                let _ = connection_state.peripheral.disconnect().await;
+            }
+
+            if stream_ended {
+                let _ = status_tx
+                    .send_replace(LinkStatus::Fatal("adapter event stream ended".to_string()));
+                continue 'reinit;
+            }
+            let _ = status_tx.send_replace(LinkStatus::Waiting);
         }
-        let _ = status_tx.send_replace(LinkStatus::Waiting);
     }
 }
 
@@ -541,6 +583,35 @@ mod tests {
         }
         assert_eq!(backoff_delay(3), Duration::from_secs(8));
         assert_eq!(backoff_delay(10), Duration::from_secs(8));
+    }
+
+    #[test]
+    fn reinit_not_triggered_below_bound() {
+        for failed in 0..MAX_ATTEMPTS_BEFORE_REINIT {
+            assert!(!should_reinit(failed), "unexpected reinit at {failed}");
+        }
+    }
+
+    #[test]
+    fn reinit_triggered_at_and_above_bound() {
+        assert!(should_reinit(MAX_ATTEMPTS_BEFORE_REINIT));
+        assert!(should_reinit(MAX_ATTEMPTS_BEFORE_REINIT + 1));
+        assert_eq!(MAX_ATTEMPTS_BEFORE_REINIT, 5);
+    }
+
+    #[test]
+    fn backoff_sequence_before_reinit_is_capped() {
+        let sequence: Vec<Duration> = (0..MAX_ATTEMPTS_BEFORE_REINIT).map(backoff_delay).collect();
+        assert_eq!(
+            sequence,
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+                Duration::from_secs(8),
+            ]
+        );
     }
 
     #[tokio::test(start_paused = true)]
