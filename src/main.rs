@@ -1,9 +1,10 @@
 use anyhow::{anyhow, Result};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-use garage_beam::ble::BtleplugClient;
+use garage_beam::ble::{BtleplugClient, SharedAdapter};
 use garage_beam::gpio::ChardevGpio;
 use garage_beam::interval::HciInterval;
 use garage_beam::run_loop;
@@ -38,11 +39,13 @@ async fn main() -> Result<()> {
         instrumentation.enabled()
     );
 
+    let shared_adapter = SharedAdapter::default();
+
     loop {
         info!("Initializing system...");
         match ChardevGpio::new("pinctrl-bcm2835", 4) {
             Ok(gpio) => {
-                let client = BtleplugClient::new(address.clone());
+                let client = BtleplugClient::new(address.clone(), Arc::clone(&shared_adapter));
                 let interval = HciInterval::new(address.clone());
                 let result = run_loop(
                     Box::new(client),

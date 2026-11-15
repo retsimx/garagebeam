@@ -143,9 +143,37 @@ impl ConnectionEpoch {
     }
 }
 
+#[derive(Default)]
+pub struct AdapterSlot {
+    adapter: Option<Adapter>,
+    scan_active: bool,
+}
+
+impl AdapterSlot {
+    fn clear(&mut self) {
+        self.adapter = None;
+        self.scan_active = false;
+    }
+
+    fn is_scan_active(&self) -> bool {
+        self.scan_active
+    }
+
+    fn set_scan_active(&mut self, active: bool) {
+        self.scan_active = active;
+    }
+}
+
+pub type SharedAdapter = Arc<Mutex<AdapterSlot>>;
+
+fn lock_slot(shared: &SharedAdapter) -> std::sync::MutexGuard<'_, AdapterSlot> {
+    shared.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub struct BtleplugClient {
     mac_address: String,
     connection: Arc<Mutex<Option<Connection>>>,
+    shared_adapter: SharedAdapter,
     reconnect_tx: mpsc::UnboundedSender<()>,
     status_tx: watch::Sender<LinkStatus>,
     status_rx: watch::Receiver<LinkStatus>,
@@ -155,12 +183,13 @@ pub struct BtleplugClient {
 }
 
 impl BtleplugClient {
-    pub fn new(mac_address: String) -> Self {
+    pub fn new(mac_address: String, shared_adapter: SharedAdapter) -> Self {
         let (status_tx, status_rx) = watch::channel(LinkStatus::Waiting);
         let (reconnect_tx, reconnect_rx) = mpsc::unbounded_channel();
         Self {
             mac_address,
             connection: Arc::new(Mutex::new(None)),
+            shared_adapter,
             reconnect_tx,
             status_tx,
             status_rx,
@@ -186,11 +215,22 @@ async fn connect_peripheral(peripheral: &Peripheral) -> Result<Characteristic> {
         .ok_or_else(|| anyhow!("Characteristic {CHARACTERISTIC_UUID} not found"))
 }
 
-/// Build a fresh BlueZ session: manager, first adapter, and the adapter's event
-/// stream. Factored out so the supervisor can rebuild all three when the
-/// adapter/scan stalls. The returned adapter owns a clone of the manager's
-/// session, so the manager itself does not need to be retained.
-async fn setup_central() -> Result<(Adapter, CentralEventStream)> {
+/// Acquire the BlueZ adapter and its event stream, reusing a cached adapter
+/// across supervisor reinits and `run_loop` restarts so we do not open a new
+/// `Manager` / D-Bus session unless needed. If a cached adapter fails to
+/// produce an event stream, clear the slot so the next attempt rebuilds cleanly.
+async fn setup_central(shared_adapter: &SharedAdapter) -> Result<(Adapter, CentralEventStream)> {
+    let cached = lock_slot(shared_adapter).adapter.clone();
+    if let Some(central) = cached {
+        return match central.events().await {
+            Ok(events) => Ok((central, events)),
+            Err(e) => {
+                lock_slot(shared_adapter).clear();
+                Err(e).context("failed to subscribe to adapter events")
+            }
+        };
+    }
+
     let manager = Manager::new()
         .await
         .context("failed to create BlueZ manager")?;
@@ -207,12 +247,24 @@ async fn setup_central() -> Result<(Adapter, CentralEventStream)> {
         .events()
         .await
         .context("failed to subscribe to adapter events")?;
+    lock_slot(shared_adapter).adapter = Some(central.clone());
     Ok((central, events))
+}
+
+async fn stop_scan_if_active(central: &Adapter, shared_adapter: &SharedAdapter) {
+    if !lock_slot(shared_adapter).is_scan_active() {
+        return;
+    }
+    if let Err(e) = central.stop_scan().await {
+        tracing::warn!(error = %e, "failed to stop BLE scan");
+    }
+    lock_slot(shared_adapter).set_scan_active(false);
 }
 
 async fn supervise(
     mac_address: String,
     connection: Arc<Mutex<Option<Connection>>>,
+    shared_adapter: SharedAdapter,
     status_tx: watch::Sender<LinkStatus>,
     epoch: Arc<ConnectionEpoch>,
     mut reconnect_rx: mpsc::UnboundedReceiver<()>,
@@ -225,7 +277,7 @@ async fn supervise(
     let mut attempt: u32 = 0;
 
     'reinit: loop {
-        let (central, mut events) = match setup_central().await {
+        let (central, mut events) = match setup_central(&shared_adapter).await {
             Ok(pair) => pair,
             Err(e) => {
                 let _ = status_tx.send_replace(LinkStatus::Fatal(e.to_string()));
@@ -248,6 +300,9 @@ async fn supervise(
             let deadline = tokio::time::Instant::now() + CONNECT_BOUND;
             let mut stream_ended = false;
 
+            stop_scan_if_active(&central, &shared_adapter).await;
+            lock_slot(&shared_adapter).set_scan_active(true);
+
             let acquired = match central.start_scan(filter.clone()).await {
                 Ok(()) => {
                     let mut acquired = None;
@@ -269,6 +324,7 @@ async fn supervise(
                                                 elapsed_ms = elapsed.as_millis() as u64,
                                                 "connecting to discovered peripheral"
                                             );
+                                            stop_scan_if_active(&central, &shared_adapter).await;
                                             match connect_peripheral(&peripheral).await {
                                                 Ok(characteristic) => {
                                                     acquired = Some((
@@ -306,14 +362,16 @@ async fn supervise(
                     acquired
                 }
                 Err(e) => {
+                    lock_slot(&shared_adapter).set_scan_active(false);
                     tracing::warn!(error = %e, "failed to start scan");
                     None
                 }
             };
 
-            let _ = central.stop_scan().await;
+            stop_scan_if_active(&central, &shared_adapter).await;
 
             if stream_ended {
+                lock_slot(&shared_adapter).clear();
                 let _ = status_tx
                     .send_replace(LinkStatus::Fatal("adapter event stream ended".to_string()));
                 attempt = 0;
@@ -332,6 +390,7 @@ async fn supervise(
                     tokio::time::sleep(delay).await;
                     if should_reinit(attempt) {
                         tracing::info!("ble_supervisor_reinit");
+                        lock_slot(&shared_adapter).clear();
                         attempt = 0;
                         continue 'reinit;
                     }
@@ -360,6 +419,10 @@ async fn supervise(
                     },
                     Some(_) = reconnect_rx.recv() => break,
                 }
+            }
+
+            if stream_ended {
+                lock_slot(&shared_adapter).clear();
             }
 
             let connection_state = connection.lock().unwrap().take();
@@ -391,6 +454,7 @@ impl BleClient for BtleplugClient {
             }
             let mac_address = self.mac_address.clone();
             let connection = Arc::clone(&self.connection);
+            let shared_adapter = Arc::clone(&self.shared_adapter);
             let status_tx = self.status_tx.clone();
             let epoch = Arc::clone(&self.epoch);
             let reconnect_rx = self
@@ -400,6 +464,7 @@ impl BleClient for BtleplugClient {
             self.supervisor = Some(tokio::spawn(supervise(
                 mac_address,
                 connection,
+                shared_adapter,
                 status_tx,
                 epoch,
                 reconnect_rx,
@@ -665,5 +730,48 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn adapter_slot_defaults_to_empty_and_inactive() {
+        let slot = AdapterSlot::default();
+        assert!(slot.adapter.is_none());
+        assert!(!slot.is_scan_active());
+    }
+
+    #[test]
+    fn adapter_slot_tracks_scan_active_and_clear_resets_state() {
+        let mut slot = AdapterSlot::default();
+        assert!(!slot.is_scan_active());
+
+        slot.set_scan_active(true);
+        assert!(slot.is_scan_active());
+
+        slot.set_scan_active(false);
+        assert!(!slot.is_scan_active());
+
+        slot.set_scan_active(true);
+        slot.clear();
+        assert!(slot.adapter.is_none());
+        assert!(!slot.is_scan_active());
+    }
+
+    #[test]
+    fn lock_slot_recovers_from_poisoned_mutex() {
+        let shared = SharedAdapter::default();
+        let shared_for_panic = Arc::clone(&shared);
+        let result = std::thread::spawn(move || {
+            let mut guard = lock_slot(&shared_for_panic);
+            guard.set_scan_active(true);
+            panic!("simulated panic while holding AdapterSlot lock");
+        })
+        .join();
+        assert!(result.is_err());
+
+        let mut recovered = lock_slot(&shared);
+        assert!(recovered.is_scan_active());
+        recovered.clear();
+        assert!(!recovered.is_scan_active());
+        assert!(recovered.adapter.is_none());
     }
 }
