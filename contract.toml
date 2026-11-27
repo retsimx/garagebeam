@@ -15,6 +15,7 @@ conn_interval_us = 7500
 conn_slave_latency = 0
 conn_supervision_timeout_ms = 8000
 keepalive_interval_ms = 10000
+keepalive_timeout_ms = 3000
 leash_timeout_ms = 30000
 
 # Telemetry contract

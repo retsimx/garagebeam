@@ -9,6 +9,13 @@ Garage Beam is an incredibly lightweight Rust service created to run on an embed
 - **D-Bus Managed**: Designed to interface smoothly in systems (especially Alpine openRC systems).
 - **Comprehensive Testing**: Tested via internal components utilizing simulated mocks (`mockall`).
 
+## BLE write and liveness contract
+
+- Startup/resync, beam-edge, and refractory re-sample writes send the 1-byte fact with ATT `Write Without Response`.
+- The steady-state keepalive is sent every 10 s with ATT `Write With Response` when the characteristic advertises `WRITE`. Pre-v12 peripherals without `WRITE` retain the compatibility `Write Without Response` fallback, with one warning.
+- Keepalive acknowledgement writes are bounded to 3000 ms. A timeout or write error disconnects the peripheral, clears the link state, and enters reconnect/resync immediately; the 30000 ms peripheral leash is no longer the only failure detector.
+- The connection interval remains 7.5 ms (`0x0006` = 6 × 1.25 ms). The contract values are mirrored in `contract.toml`.
+
 ## Requirements
 
 Ensure the target system includes D-Bus and BlueZ:

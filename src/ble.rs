@@ -1,12 +1,14 @@
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use btleplug::api::{
-    Central, CentralEvent, Characteristic, Manager as _, Peripheral as _, ScanFilter, WriteType,
+    Central, CentralEvent, CharPropFlags, Characteristic, Manager as _, Peripheral as _,
+    ScanFilter, WriteType,
 };
 use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::{Stream, StreamExt};
@@ -17,6 +19,8 @@ pub const CHARACTERISTIC_UUID: &str = "6a4c0002-b5a3-4f1e-9c2d-7e8f9a0b1c2d";
 pub const FACT_INTACT: u8 = 0x00;
 pub const FACT_BROKEN: u8 = 0x01;
 pub const CONNECT_BOUND: Duration = Duration::from_secs(30);
+pub const KEEPALIVE_TIMEOUT_MS: u64 = 3000;
+pub const WRITE_TIMEOUT: Duration = Duration::from_millis(KEEPALIVE_TIMEOUT_MS);
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
 const BACKOFF_MAX_SHIFT: u32 = 3;
 /// Consecutive failed acquisitions (a scan window that produced no connection)
@@ -34,7 +38,7 @@ use mockall::{automock, predicate::*};
 #[async_trait]
 pub trait BleClient: Send + Sync {
     async fn connect(&mut self) -> Result<()>;
-    async fn write_state(&self, state: bool) -> Result<()>;
+    async fn write_state(&self, state: bool, ack: bool) -> Result<()>;
     /// Measurement-only read of the 1-byte fact characteristic. This is not
     /// part of the control path: it exists solely to sample write-to-read
     /// latency and must never gate or alter a write decision.
@@ -79,6 +83,105 @@ pub fn fact_byte(state: bool) -> u8 {
         FACT_BROKEN
     } else {
         FACT_INTACT
+    }
+}
+
+/// Select the ATT write mode for an acknowledged or non-acknowledged write.
+/// Pre-v12 peripherals without the WRITE property remain usable through the
+/// WriteWithoutResponse compatibility path.
+pub fn select_write_type(properties: CharPropFlags, ack: bool) -> (WriteType, bool) {
+    if !ack {
+        (WriteType::WithoutResponse, false)
+    } else if properties.contains(CharPropFlags::WRITE) {
+        (WriteType::WithResponse, false)
+    } else {
+        (WriteType::WithoutResponse, true)
+    }
+}
+
+pub async fn bounded_write<T, F>(future: F) -> std::result::Result<T, tokio::time::error::Elapsed>
+where
+    F: Future<Output = T>,
+{
+    tokio::time::timeout(WRITE_TIMEOUT, future).await
+}
+
+fn clear_connection_and_signal_reconnect<T>(
+    connection: &Arc<Mutex<Option<T>>>,
+    reconnect_tx: &mpsc::UnboundedSender<()>,
+) {
+    *connection.lock().unwrap() = None;
+    let _ = reconnect_tx.send(());
+}
+
+async fn bounded_disconnect<F>(future: F) -> std::result::Result<(), tokio::time::error::Elapsed>
+where
+    F: Future<Output = ()>,
+{
+    tokio::time::timeout(WRITE_TIMEOUT, future).await
+}
+
+fn start_write_failure_teardown<T, D, DF>(
+    connection: &Arc<Mutex<Option<T>>>,
+    reconnect_tx: &mpsc::UnboundedSender<()>,
+    disconnect: D,
+) where
+    D: FnOnce() -> DF + Send + 'static,
+    DF: Future<Output = ()> + Send + 'static,
+{
+    // Drop the shared target and wake the supervisor before starting any
+    // potentially blocking peripheral teardown.
+    clear_connection_and_signal_reconnect(connection, reconnect_tx);
+
+    let disconnect_future = disconnect();
+    tokio::spawn(async move {
+        match bounded_disconnect(disconnect_future).await {
+            Ok(()) => {}
+            Err(_) => tracing::warn!(
+                timeout_ms = WRITE_TIMEOUT.as_millis() as u64,
+                "BLE peripheral disconnect timed out"
+            ),
+        }
+    });
+}
+
+async fn write_state_with_teardown<W, E, D, DF, T>(
+    write_future: W,
+    disconnect: D,
+    connection: &Arc<Mutex<Option<T>>>,
+    reconnect_tx: &mpsc::UnboundedSender<()>,
+    write_type: WriteType,
+) -> Result<()>
+where
+    W: Future<Output = std::result::Result<(), E>>,
+    E: Into<anyhow::Error> + Send + Sync + 'static,
+    D: FnOnce() -> DF + Send + 'static,
+    DF: Future<Output = ()> + Send + 'static,
+{
+    match bounded_write(write_future).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => {
+            let e: anyhow::Error = e.into();
+            tracing::warn!(
+                write_type = ?write_type,
+                error = %e,
+                "BLE state write failed"
+            );
+            start_write_failure_teardown(connection, reconnect_tx, disconnect);
+            Err(e).context("Failed to write to state characteristic")
+        }
+        Err(_) => {
+            tracing::warn!(
+                write_type = ?write_type,
+                timeout_ms = WRITE_TIMEOUT.as_millis() as u64,
+                "BLE state write timed out"
+            );
+            start_write_failure_teardown(connection, reconnect_tx, disconnect);
+            Err(anyhow!(
+                "state characteristic write timed out after {} ms",
+                WRITE_TIMEOUT.as_millis()
+            ))
+        }
     }
 }
 
@@ -180,6 +283,7 @@ pub struct BtleplugClient {
     epoch: Arc<ConnectionEpoch>,
     reconnect_rx: Option<mpsc::UnboundedReceiver<()>>,
     supervisor: Option<tokio::task::JoinHandle<()>>,
+    ack_fallback_warned: AtomicBool,
 }
 
 impl BtleplugClient {
@@ -196,6 +300,7 @@ impl BtleplugClient {
             epoch: Arc::new(ConnectionEpoch::new()),
             reconnect_rx: Some(reconnect_rx),
             supervisor: None,
+            ack_fallback_warned: AtomicBool::new(false),
         }
     }
 }
@@ -491,7 +596,7 @@ impl BleClient for BtleplugClient {
         }
     }
 
-    async fn write_state(&self, state: bool) -> Result<()> {
+    async fn write_state(&self, state: bool, ack: bool) -> Result<()> {
         let target = {
             let connection = self.connection.lock().unwrap();
             connection.as_ref().map(|connection| {
@@ -503,21 +608,26 @@ impl BleClient for BtleplugClient {
         };
         let (peripheral, characteristic) = target.ok_or_else(|| anyhow!("not connected"))?;
 
-        let byte = fact_byte(state);
-        if let Err(e) = peripheral
-            .write(&characteristic, &[byte], WriteType::WithoutResponse)
-            .await
-        {
-            // Disconnect before clearing the shared slot. The supervisor tears
-            // down whatever the slot holds, so clearing first would make its
-            // `take()` yield `None` and skip `peripheral.disconnect()`, leaving
-            // the LE link up with no further discovery events.
-            let _ = peripheral.disconnect().await;
-            *self.connection.lock().unwrap() = None;
-            let _ = self.reconnect_tx.send(());
-            return Err(e).context("Failed to write to state characteristic");
+        let (write_type, property_fallback) = select_write_type(characteristic.properties, ack);
+        if property_fallback && !self.ack_fallback_warned.swap(true, Ordering::SeqCst) {
+            tracing::warn!(
+                characteristic = CHARACTERISTIC_UUID,
+                "ACK requested but characteristic lacks WRITE property; using WriteWithoutResponse compatibility fallback"
+            );
         }
-        Ok(())
+
+        let byte = fact_byte(state);
+        let peripheral_for_disconnect = peripheral.clone();
+        write_state_with_teardown(
+            peripheral.write(&characteristic, &[byte], write_type),
+            move || async move {
+                let _ = peripheral_for_disconnect.disconnect().await;
+            },
+            &self.connection,
+            &self.reconnect_tx,
+            write_type,
+        )
+        .await
     }
 
     async fn read_state(&self) -> Result<u8> {
@@ -577,6 +687,180 @@ mod tests {
         assert_eq!(fact_byte(true), FACT_BROKEN);
         assert_eq!(FACT_INTACT, 0x00);
         assert_eq!(FACT_BROKEN, 0x01);
+    }
+
+    #[test]
+    fn ack_selects_with_response_when_write_property_exists() {
+        let (write_type, fallback) = select_write_type(CharPropFlags::WRITE, true);
+        assert_eq!(write_type, WriteType::WithResponse);
+        assert!(!fallback);
+    }
+
+    #[test]
+    fn no_ack_always_selects_without_response() {
+        let (write_type, fallback) = select_write_type(
+            CharPropFlags::WRITE | CharPropFlags::WRITE_WITHOUT_RESPONSE,
+            false,
+        );
+        assert_eq!(write_type, WriteType::WithoutResponse);
+        assert!(!fallback);
+    }
+
+    #[test]
+    fn ack_falls_back_once_when_write_property_is_absent() {
+        let (write_type, fallback) = select_write_type(
+            CharPropFlags::READ | CharPropFlags::WRITE_WITHOUT_RESPONSE,
+            true,
+        );
+        assert_eq!(write_type, WriteType::WithoutResponse);
+        assert!(fallback);
+    }
+
+    #[test]
+    fn write_timeout_is_three_seconds() {
+        assert_eq!(WRITE_TIMEOUT, Duration::from_secs(3));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn write_completes_before_three_second_boundary() {
+        let result = bounded_write(async {
+            tokio::time::sleep(Duration::from_millis(2999)).await;
+            42
+        })
+        .await;
+        assert_eq!(result, Ok(42));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn write_times_out_after_three_second_boundary() {
+        let result = bounded_write(async {
+            tokio::time::sleep(Duration::from_millis(3001)).await;
+            42
+        })
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disconnect_is_bounded_by_three_seconds() {
+        let started = tokio::time::Instant::now();
+        let result = bounded_disconnect(async {
+            std::future::pending::<()>().await;
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started),
+            WRITE_TIMEOUT
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn write_timeout_clears_signals_and_does_not_wait_for_stalled_disconnect() {
+        let connection = Arc::new(Mutex::new(Some(42u8)));
+        let connection_for_disconnect = Arc::clone(&connection);
+        let (reconnect_tx, mut reconnect_rx) = mpsc::unbounded_channel();
+        let clear_seen_before_disconnect = Arc::new(AtomicBool::new(false));
+        let clear_seen_for_disconnect = Arc::clone(&clear_seen_before_disconnect);
+        let disconnect_started = Arc::new(AtomicBool::new(false));
+        let disconnect_started_for_disconnect = Arc::clone(&disconnect_started);
+
+        let started = tokio::time::Instant::now();
+        let result = write_state_with_teardown(
+            async { std::future::pending::<std::result::Result<(), anyhow::Error>>().await },
+            move || {
+                clear_seen_for_disconnect.store(
+                    connection_for_disconnect.lock().unwrap().is_none(),
+                    Ordering::SeqCst,
+                );
+                disconnect_started_for_disconnect.store(true, Ordering::SeqCst);
+                async move {
+                    std::future::pending::<()>().await;
+                }
+            },
+            &connection,
+            &reconnect_tx,
+            WriteType::WithoutResponse,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started),
+            WRITE_TIMEOUT
+        );
+        assert!(clear_seen_before_disconnect.load(Ordering::SeqCst));
+        assert!(disconnect_started.load(Ordering::SeqCst));
+        assert_eq!(*connection.lock().unwrap(), None);
+        assert!(reconnect_rx.try_recv().is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn write_error_clears_signals_and_does_not_wait_for_stalled_disconnect() {
+        let connection = Arc::new(Mutex::new(Some(42u8)));
+        let (reconnect_tx, mut reconnect_rx) = mpsc::unbounded_channel();
+        let disconnect_started = Arc::new(AtomicBool::new(false));
+        let disconnect_started_for_disconnect = Arc::clone(&disconnect_started);
+
+        let started = tokio::time::Instant::now();
+        let result = write_state_with_teardown(
+            async { Err(anyhow!("write failed")) },
+            move || {
+                disconnect_started_for_disconnect.store(true, Ordering::SeqCst);
+                async move {
+                    std::future::pending::<()>().await;
+                }
+            },
+            &connection,
+            &reconnect_tx,
+            WriteType::WithResponse,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started),
+            Duration::ZERO
+        );
+        assert!(disconnect_started.load(Ordering::SeqCst));
+        assert_eq!(*connection.lock().unwrap(), None);
+        assert!(reconnect_rx.try_recv().is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn write_success_keeps_connection_and_does_not_start_disconnect() {
+        let connection = Arc::new(Mutex::new(Some(42u8)));
+        let (reconnect_tx, mut reconnect_rx) = mpsc::unbounded_channel();
+        let disconnect_started = Arc::new(AtomicBool::new(false));
+        let disconnect_started_for_disconnect = Arc::clone(&disconnect_started);
+
+        let result = write_state_with_teardown(
+            async { Ok::<(), anyhow::Error>(()) },
+            move || {
+                disconnect_started_for_disconnect.store(true, Ordering::SeqCst);
+                async move {}
+            },
+            &connection,
+            &reconnect_tx,
+            WriteType::WithoutResponse,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(!disconnect_started.load(Ordering::SeqCst));
+        assert_eq!(*connection.lock().unwrap(), Some(42u8));
+        assert!(reconnect_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn write_failure_clears_connection_and_signals_reconnect() {
+        let connection = Arc::new(Mutex::new(Some(42u8)));
+        let (reconnect_tx, mut reconnect_rx) = mpsc::unbounded_channel();
+
+        clear_connection_and_signal_reconnect(&connection, &reconnect_tx);
+
+        assert_eq!(*connection.lock().unwrap(), None);
+        assert!(reconnect_rx.try_recv().is_ok());
     }
 
     #[test]

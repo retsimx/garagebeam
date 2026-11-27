@@ -72,7 +72,7 @@ pub async fn run_loop(
     if let WriteDecision::Write(value) =
         schedule_write(ConnectionEvent::Connected, None, last_write, fact, now)
     {
-        client.write_state(value).await?;
+        client.write_state(value, false).await?;
         last_fact = Some(value);
         last_write = Some(now);
     }
@@ -105,7 +105,7 @@ pub async fn run_loop(
                         fact,
                         now,
                     ) {
-                        client.write_state(value).await?;
+                        client.write_state(value, false).await?;
                         last_fact = Some(value);
                         last_write = Some(now);
                     }
@@ -120,7 +120,7 @@ pub async fn run_loop(
                         fact,
                         now,
                     ) {
-                        client.write_state(value).await?;
+                        client.write_state(value, true).await?;
                         last_fact = Some(value);
                         last_write = Some(now);
                     }
@@ -144,7 +144,7 @@ pub async fn run_loop(
                     {
                         if instrumentation.enabled() {
                             let t_write = crate::instrumentation::monotonic_ns();
-                            client.write_state(value).await?;
+                            client.write_state(value, false).await?;
                             if t_write < edge.timestamp_ns {
                                 tracing::warn!(
                                     target: "garage_beam::latency",
@@ -189,7 +189,7 @@ pub async fn run_loop(
                                 }
                             }
                         } else {
-                            client.write_state(value).await?;
+                            client.write_state(value, false).await?;
                         }
                         last_fact = Some(value);
                         last_write = Some(now);
@@ -204,7 +204,7 @@ pub async fn run_loop(
                     if let WriteDecision::Write(value) =
                         schedule_write(ConnectionEvent::Steady, last_fact, last_write, fact, now)
                     {
-                        client.write_state(value).await?;
+                        client.write_state(value, false).await?;
                         last_fact = Some(value);
                         last_write = Some(now);
                     }
@@ -254,8 +254,8 @@ mod tests {
             self.inner.connect().await
         }
 
-        async fn write_state(&self, state: bool) -> Result<()> {
-            self.inner.write_state(state).await
+        async fn write_state(&self, state: bool, ack: bool) -> Result<()> {
+            self.inner.write_state(state, ack).await
         }
 
         async fn read_state(&self) -> Result<u8> {
@@ -279,7 +279,7 @@ mod tests {
     /// `wait_for_reconnect` resolve exactly once (the first call) so the loop
     /// sees a single reconnect before `wait_for_edge` terminates the run.
     struct FakeReconnectClient {
-        writes: Arc<Mutex<Vec<bool>>>,
+        writes: Arc<Mutex<Vec<(bool, bool)>>>,
         reconnect_calls: Arc<AtomicUsize>,
     }
 
@@ -289,8 +289,8 @@ mod tests {
             Ok(())
         }
 
-        async fn write_state(&self, state: bool) -> Result<()> {
-            self.writes.lock().unwrap().push(state);
+        async fn write_state(&self, state: bool, ack: bool) -> Result<()> {
+            self.writes.lock().unwrap().push((state, ack));
             Ok(())
         }
 
@@ -312,16 +312,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_samples_and_writes_before_any_edge() {
+    async fn startup_samples_and_writes_without_ack_before_any_edge() {
         let mut client = MockBleClient::new();
         let mut gpio = MockGpioReader::new();
 
         client.expect_connect().times(1).returning(|| Ok(()));
         client
             .expect_write_state()
-            .with(eq(true))
+            .with(eq(true), eq(false))
             .times(1)
-            .returning(|_| Ok(()));
+            .returning(|_, _| Ok(()));
         gpio.expect_read_level()
             .times(1)
             .returning(|| Ok(Level::Low));
@@ -340,16 +340,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepted_edge_writes_once_when_level_differs() {
+    async fn accepted_edge_writes_once_without_ack_when_level_differs() {
         let mut client = MockBleClient::new();
         let mut gpio = MockGpioReader::new();
 
         client.expect_connect().times(1).returning(|| Ok(()));
         client
             .expect_write_state()
-            .with(eq(true))
+            .with(eq(true), eq(false))
             .times(1)
-            .returning(|_| Ok(()));
+            .returning(|_, _| Ok(()));
         gpio.expect_read_level()
             .times(1)
             .returning(|| Ok(Level::Low));
@@ -363,9 +363,9 @@ mod tests {
 
         client
             .expect_write_state()
-            .with(eq(false))
+            .with(eq(false), eq(false))
             .times(1)
-            .returning(|_| Ok(()));
+            .returning(|_, _| Ok(()));
 
         let res = run_loop(
             pending(client),
@@ -385,14 +385,14 @@ mod tests {
         client.expect_connect().times(1).returning(|| Ok(()));
         client
             .expect_write_state()
-            .with(eq(true))
+            .with(eq(true), eq(false))
             .times(1)
-            .returning(|_| Ok(()));
+            .returning(|_, _| Ok(()));
         client
             .expect_write_state()
-            .with(eq(false))
+            .with(eq(false), eq(false))
             .times(1)
-            .returning(|_| Ok(()));
+            .returning(|_, _| Ok(()));
         client.expect_read_state().times(1).returning(|| Ok(0));
         gpio.expect_read_level()
             .times(1)
@@ -422,14 +422,14 @@ mod tests {
         client.expect_connect().times(1).returning(|| Ok(()));
         client
             .expect_write_state()
-            .with(eq(true))
+            .with(eq(true), eq(false))
             .times(1)
-            .returning(|_| Ok(()));
+            .returning(|_, _| Ok(()));
         client
             .expect_write_state()
-            .with(eq(false))
+            .with(eq(false), eq(false))
             .times(1)
-            .returning(|_| Ok(()));
+            .returning(|_, _| Ok(()));
         client
             .expect_read_state()
             .times(1)
@@ -462,14 +462,14 @@ mod tests {
         client.expect_connect().times(1).returning(|| Ok(()));
         client
             .expect_write_state()
-            .with(eq(true))
+            .with(eq(true), eq(false))
             .times(1)
-            .returning(|_| Ok(()));
+            .returning(|_, _| Ok(()));
         client
             .expect_write_state()
-            .with(eq(false))
+            .with(eq(false), eq(false))
             .times(1)
-            .returning(|_| Ok(()));
+            .returning(|_, _| Ok(()));
         // No `expect_read_state`: any read would panic and fail the run.
         gpio.expect_read_level()
             .times(1)
@@ -499,9 +499,9 @@ mod tests {
         client.expect_connect().times(1).returning(|| Ok(()));
         client
             .expect_write_state()
-            .with(eq(true))
+            .with(eq(true), eq(false))
             .times(1)
-            .returning(|_| Ok(()));
+            .returning(|_, _| Ok(()));
         gpio.expect_read_level()
             .times(1)
             .returning(|| Ok(Level::Low));
@@ -518,9 +518,9 @@ mod tests {
 
         client
             .expect_write_state()
-            .with(eq(false))
+            .with(eq(false), eq(false))
             .times(1)
-            .returning(|_| Ok(()));
+            .returning(|_, _| Ok(()));
 
         let res = run_loop(
             pending(client),
@@ -592,15 +592,20 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn keepalive_writes_current_fact_every_10s_while_idle() {
+    async fn keepalive_writes_current_fact_with_ack_every_10s_while_idle() {
         let mut client = MockBleClient::new();
 
         client.expect_connect().times(1).returning(|| Ok(()));
         client
             .expect_write_state()
-            .with(eq(true))
-            .times(4)
-            .returning(|_| Ok(()));
+            .with(eq(true), eq(false))
+            .times(1)
+            .returning(|_, _| Ok(()));
+        client
+            .expect_write_state()
+            .with(eq(true), eq(true))
+            .times(3)
+            .returning(|_, _| Ok(()));
 
         // Stop off the 10 s tick boundary so the unbiased `select!` cannot race
         // the keepalive tick against the terminal edge error.
@@ -623,9 +628,9 @@ mod tests {
         client.expect_connect().times(1).returning(|| Ok(()));
         client
             .expect_write_state()
-            .with(eq(true))
+            .with(eq(true), eq(false))
             .times(1)
-            .returning(|_| Ok(()));
+            .returning(|_, _| Ok(()));
 
         let gpio = FakePendingReader::new(Level::Low, Duration::from_secs(5));
 
@@ -640,7 +645,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn reconnect_resyncs_current_fact_once() {
+    async fn reconnect_resyncs_current_fact_once_without_ack() {
         let writes = Arc::new(Mutex::new(Vec::new()));
         let reconnect_calls = Arc::new(AtomicUsize::new(0));
         let client = FakeReconnectClient {
@@ -661,24 +666,24 @@ mod tests {
         .await;
 
         assert_eq!(res.unwrap_err().to_string(), "stop");
-        assert_eq!(*writes.lock().unwrap(), vec![true, true]);
+        assert_eq!(*writes.lock().unwrap(), vec![(true, false), (true, false)]);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn refractory_timeout_resamples_and_adopts_changed_level() {
+    async fn refractory_timeout_resamples_and_adopts_changed_level_without_ack() {
         let mut client = MockBleClient::new();
 
         client.expect_connect().times(1).returning(|| Ok(()));
         client
             .expect_write_state()
-            .with(eq(true))
+            .with(eq(true), eq(false))
             .times(1)
-            .returning(|_| Ok(()));
+            .returning(|_, _| Ok(()));
         client
             .expect_write_state()
-            .with(eq(false))
+            .with(eq(false), eq(false))
             .times(1)
-            .returning(|_| Ok(()));
+            .returning(|_, _| Ok(()));
 
         let read_level_calls = Arc::new(AtomicUsize::new(0));
         let wait_for_edge_calls = Arc::new(AtomicUsize::new(0));
@@ -722,10 +727,10 @@ mod tests {
             .returning(|| Ok(()));
         client
             .expect_write_state()
-            .with(eq(true))
+            .with(eq(true), eq(false))
             .times(1)
             .in_sequence(&mut sequence)
-            .returning(|_| Ok(()));
+            .returning(|_, _| Ok(()));
         gpio.expect_read_level()
             .times(1)
             .returning(|| Ok(Level::Low));
@@ -758,9 +763,9 @@ mod tests {
         interval.expect_start_guard().times(1).returning(|| Ok(()));
         client
             .expect_write_state()
-            .with(eq(true))
+            .with(eq(true), eq(false))
             .times(1)
-            .returning(|_| Ok(()));
+            .returning(|_, _| Ok(()));
         gpio.expect_read_level()
             .times(1)
             .returning(|| Ok(Level::Low));
@@ -792,9 +797,9 @@ mod tests {
             .returning(|| Err(anyhow::anyhow!("bind HCI monitor socket: EINVAL")));
         client
             .expect_write_state()
-            .with(eq(true))
+            .with(eq(true), eq(false))
             .times(1)
-            .returning(|_| Ok(()));
+            .returning(|_, _| Ok(()));
         gpio.expect_read_level()
             .times(1)
             .returning(|| Ok(Level::Low));
