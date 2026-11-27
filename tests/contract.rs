@@ -54,6 +54,18 @@ fn contract_matches_code_constants() {
         garage_beam::KEEPALIVE.as_millis() as u64
     );
     assert_eq!(num("keepalive_interval_ms"), 10000);
+    assert_eq!(
+        num("keepalive_timeout_ms"),
+        garage_beam::ble::KEEPALIVE_TIMEOUT_MS
+    );
+    assert_eq!(
+        num("keepalive_timeout_ms"),
+        garage_beam::ble::WRITE_TIMEOUT.as_millis() as u64
+    );
+    assert_eq!(num("keepalive_timeout_ms"), 3000);
+    assert_eq!(num("leash_timeout_ms"), 30000);
+    assert!(num("keepalive_timeout_ms") < num("keepalive_interval_ms"));
     assert!(num("leash_timeout_ms") > num("keepalive_interval_ms"));
+    assert!(num("leash_timeout_ms") > num("keepalive_timeout_ms"));
     assert!(!get("mqtt_topic").is_empty());
 }
