@@ -88,4 +88,27 @@ jobs:
             exit 0
           fi
           if [ "$code" != "200" ]; then echo "::error::unexpected HTTP $code fetching $URL"; exit 1; fi
-          cmp -s contract.toml /tmp/peer-contract.toml || { echo "::error::contract.toml differs from sibling"; diff -u contract.toml /tmp/peer-contract.toml; exit 1; }
+          python3 - <<'PY'
+          import sys
+          from pathlib import Path
+          import tomllib
+
+          local = tomllib.loads(Path("contract.toml").read_text())
+          peer = tomllib.loads(Path("/tmp/peer-contract.toml").read_text())
+
+          local_timeout = local.pop("keepalive_timeout_ms", None)
+          peer_timeout = peer.pop("keepalive_timeout_ms", None)
+
+          if local_timeout != 3000:
+              print("::error::local keepalive_timeout_ms must be 3000")
+              sys.exit(1)
+          if peer_timeout is not None and peer_timeout != local_timeout:
+              print("::error::keepalive_timeout_ms differs from sibling")
+              sys.exit(1)
+          if local != peer:
+              print("::error::contract.toml differs from sibling outside the coordinated keepalive_timeout_ms field")
+              print("local-only keys:", sorted(set(local) - set(peer)))
+              print("peer-only keys:", sorted(set(peer) - set(local)))
+              sys.exit(1)
+          print("contract fields match; keepalive timeout=3000")
+          PY
